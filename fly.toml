@@ -1,0 +1,49 @@
+app = "voiceagentautomation"
+primary_region = "yyz"
+kill_signal = "SIGINT"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  PORT = "8080"
+  PROXY_PORT = "8080"
+  MCP_PORT = "8000"
+  VOICE_PORT = "8002"
+  RUNTIME_DIR = "/data"
+  VOICE_RUNTIME_PATH = "/data/runtime.json"
+  VOICE_STATE_PATH = "/data/tenant-screening-state.json"
+  VALIDATE_TWILIO_WEBHOOKS = "true"
+  TWILIO_TTS_VOICE = "Google.en-US-Chirp3-HD-Aoede"
+  TWILIO_TTS_VOICE_FALLBACK = "Polly.Joanna-Neural"
+  TWILIO_TTS_LANGUAGE = "en-US"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = false
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 50
+    hard_limit = 100
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "30s"
+    method = "GET"
+    path = "/health"
+
+[[mounts]]
+  source = "app_data"
+  destination = "/data"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 1024

@@ -2,9 +2,9 @@ const http = require('http');
 const httpProxy = require('http-proxy');
 const { timingSafeEqual } = require('crypto');
 
-const MCP_PORT = 8000;
-const VOICE_PORT = 8002;
-const PROXY_PORT = 8001;
+const MCP_PORT = Number(process.env.MCP_PORT || 8000);
+const VOICE_PORT = Number(process.env.VOICE_PORT || 8002);
+const PROXY_PORT = Number(process.env.PROXY_PORT || process.env.PORT || 8001);
 const EXPECTED_BEARER_TOKEN = process.env.MCP_BEARER_TOKEN;
 
 if (!EXPECTED_BEARER_TOKEN) {
@@ -24,6 +24,12 @@ function isAuthorized(req) {
 
 function route(req, res) {
   const url = req.url || '/';
+
+  if (url === '/health') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, proxyPort: PROXY_PORT, mcpPort: MCP_PORT, voicePort: VOICE_PORT }));
+    return;
+  }
 
   if (url.startsWith('/mcp')) {
     if (!isAuthorized(req)) {

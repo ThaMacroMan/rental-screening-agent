@@ -26,6 +26,7 @@ if (!agentId) {
 
 const runtimePath = process.env.VOICE_RUNTIME_PATH || path.join(__dirname, '.runtime', 'runtime.json');
 const statePath = process.env.VOICE_STATE_PATH || path.join(__dirname, '.runtime', 'tenant-screening-state.json');
+const publicBaseUrl = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
 // Voice options for quick switching:
 // const defaultVoice = process.env.TWILIO_TTS_VOICE || 'Polly.Joanna-Generative';
 // const defaultVoice = process.env.TWILIO_TTS_VOICE || 'Google.en-US-Chirp3-HD-Aoede';
@@ -46,6 +47,7 @@ const smtpUser = process.env.SMTP_USER || '';
 const smtpPass = process.env.SMTP_PASS || '';
 
 const app = express();
+app.set('trust proxy', true);
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
@@ -403,7 +405,8 @@ function validateTwilioRequest(req) {
   }
 
   const signature = req.get('X-Twilio-Signature') || '';
-  const url = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+  const externalBaseUrl = publicBaseUrl || `${req.protocol}://${req.get('host')}`;
+  const url = `${externalBaseUrl}${req.originalUrl}`;
   return twilio.validateRequest(twilioAuthToken, signature, url, req.body);
 }
 

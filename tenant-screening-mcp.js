@@ -16,8 +16,8 @@ function requiredEnv(name) {
 }
 
 const accountSid = requiredEnv("TWILIO_ACCOUNT_SID");
-const apiKeySid = requiredEnv("SID");
-const apiKeySecret = requiredEnv("SECRET");
+const apiKeySid = requiredEnv("TWILIO_API_KEY_SID");
+const apiKeySecret = requiredEnv("TWILIO_API_KEY_SECRET");
 const defaultFromNumber = process.env.TWILIO_FROM_NUMBER || "";
 const runtimePath = process.env.VOICE_RUNTIME_PATH || path.join(__dirname, ".runtime", "runtime.json");
 
