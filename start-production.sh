@@ -9,14 +9,14 @@ PROXY_PORT="${PROXY_PORT:-${PORT:-8080}}"
 RUNTIME_DIR="${RUNTIME_DIR:-/data}"
 RUNTIME_FILE="${VOICE_RUNTIME_PATH:-${RUNTIME_DIR}/runtime.json}"
 STATE_FILE="${VOICE_STATE_PATH:-${RUNTIME_DIR}/tenant-screening-state.json}"
-PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
+APP_BASE_URL="${APP_BASE_URL:-}"
 
-if [ -z "$PUBLIC_BASE_URL" ] && [ -n "${FLY_APP_NAME:-}" ]; then
-  PUBLIC_BASE_URL="https://${FLY_APP_NAME}.fly.dev"
+if [ -z "$APP_BASE_URL" ] && [ -n "${FLY_APP_NAME:-}" ]; then
+  APP_BASE_URL="https://${FLY_APP_NAME}.fly.dev"
 fi
 
-if [ -z "$PUBLIC_BASE_URL" ]; then
-  echo "Missing PUBLIC_BASE_URL. Set it to your public app base URL, for example https://voice.example.com"
+if [ -z "$APP_BASE_URL" ]; then
+  echo "Missing APP_BASE_URL. Set it to your public app base URL, for example https://voice.example.com"
   exit 1
 fi
 
@@ -25,24 +25,26 @@ mkdir -p "$RUNTIME_DIR"
 export MCP_PORT
 export VOICE_PORT
 export PROXY_PORT
+export APP_BASE_URL="$APP_BASE_URL"
 export VOICE_RUNTIME_PATH="$RUNTIME_FILE"
 export VOICE_STATE_PATH="$STATE_FILE"
-export VOICE_PUBLIC_BASE_URL="$PUBLIC_BASE_URL"
+export VOICE_PUBLIC_BASE_URL="$APP_BASE_URL"
 
-node - "$RUNTIME_FILE" "$PUBLIC_BASE_URL" <<'NODE'
+node - "$RUNTIME_FILE" "$APP_BASE_URL" <<'NODE'
 const fs = require('fs');
 const path = require('path');
 
 const runtimeFile = process.argv[2];
-const publicBaseUrl = process.argv[3].replace(/\/$/, '');
+const appBaseUrl = process.argv[3].replace(/\/$/, '');
 
 fs.mkdirSync(path.dirname(runtimeFile), { recursive: true });
 fs.writeFileSync(runtimeFile, `${JSON.stringify({
-  publicBaseUrl,
-  mcpUrl: `${publicBaseUrl}/mcp`,
-  voiceStartUrl: `${publicBaseUrl}/voice/start`,
-  voiceTurnUrl: `${publicBaseUrl}/voice/turn`,
-  voiceStateUrl: `${publicBaseUrl}/voice/state`,
+  appBaseUrl,
+  publicBaseUrl: appBaseUrl,
+  mcpUrl: `${appBaseUrl}/mcp`,
+  voiceStartUrl: `${appBaseUrl}/voice/start`,
+  voiceTurnUrl: `${appBaseUrl}/voice/turn`,
+  voiceStateUrl: `${appBaseUrl}/voice/state`,
   updatedAt: new Date().toISOString(),
 }, null, 2)}\n`);
 NODE

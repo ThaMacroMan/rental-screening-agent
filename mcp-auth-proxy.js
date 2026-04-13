@@ -50,6 +50,18 @@ function route(req, res) {
     return;
   }
 
+  if (url.startsWith('/testing')) {
+    console.log(`[testing] ${req.method} ${req.url}`);
+    proxy.web(req, res, { target: `http://localhost:${VOICE_PORT}` });
+    return;
+  }
+
+  if (url.startsWith('/formspree')) {
+    console.log(`[formspree] ${req.method} ${req.url}`);
+    proxy.web(req, res, { target: `http://localhost:${VOICE_PORT}` });
+    return;
+  }
+
   res.writeHead(404, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not found' }));
 }

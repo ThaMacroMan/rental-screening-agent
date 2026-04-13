@@ -135,6 +135,7 @@ runtime_file = Path(sys.argv[1])
 public_base_url = sys.argv[2].rstrip('/')
 payload = {
     "publicBaseUrl": public_base_url,
+    "appBaseUrl": public_base_url,
     "mcpUrl": f"{public_base_url}/mcp",
     "voiceStartUrl": f"{public_base_url}/voice/start",
     "voiceTurnUrl": f"{public_base_url}/voice/turn",
@@ -145,6 +146,7 @@ runtime_file.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
 
 export VOICE_PUBLIC_BASE_URL="$NGROK_URL"
+export APP_BASE_URL="$NGROK_URL"
 export VOICE_MCP_URL="${NGROK_URL}/mcp"
 export VOICE_START_URL="${NGROK_URL}/voice/start"
 export VOICE_TURN_URL="${NGROK_URL}/voice/turn"

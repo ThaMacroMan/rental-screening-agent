@@ -38,7 +38,7 @@ function resolveScreeningUrl(args) {
   }
 
   const runtime = readRuntimeConfig();
-  const baseUrl = runtime?.publicBaseUrl || process.env.VOICE_PUBLIC_BASE_URL;
+  const baseUrl = runtime?.appBaseUrl || runtime?.publicBaseUrl || process.env.VOICE_PUBLIC_BASE_URL || process.env.APP_BASE_URL;
   if (!baseUrl) {
     throw new Error("Provide screeningUrl or start the launcher first so the live voice URL is available.");
   }
@@ -57,7 +57,7 @@ function buildStartCallParams(args) {
     throw new Error("No caller ID available. Set TWILIO_FROM_NUMBER or pass from explicitly.");
   }
 
-  if (args.screeningUrl || readRuntimeConfig() || process.env.VOICE_PUBLIC_BASE_URL) {
+  if (args.screeningUrl || readRuntimeConfig() || process.env.VOICE_PUBLIC_BASE_URL || process.env.APP_BASE_URL) {
     const screeningUrl = resolveScreeningUrl(args);
     if (args.prospectName) {
       screeningUrl.searchParams.set("prospectName", args.prospectName);
