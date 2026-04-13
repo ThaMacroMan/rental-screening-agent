@@ -20,6 +20,17 @@ const environmentId = requiredEnv('ENVIRONMENT_ID');
 const twilioAuthToken = requiredEnv('TWILIO_AUTH_TOKEN');
 const twilioAccountSid = requiredEnv('TWILIO_ACCOUNT_SID');
 const twilioFromNumber = requiredEnv('TWILIO_FROM_NUMBER');
+const defaultFromNumber = twilioFromNumber;
+const gatherSpeechModel = process.env.TWILIO_GATHER_SPEECH_MODEL || 'phone_call';
+
+function readPositiveNumberEnv(name, fallback) {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const gatherSpeechTimeout = readPositiveNumberEnv('TWILIO_GATHER_SPEECH_TIMEOUT', 5);
+const gatherTimeout = readPositiveNumberEnv('TWILIO_GATHER_TIMEOUT', 10);
+const lowConfidenceThreshold = readPositiveNumberEnv('TWILIO_GATHER_LOW_CONFIDENCE_THRESHOLD', 0.58);
 
 if (!agentId) {
   throw new Error('Missing required environment variable: VOICE_AGENT_ID or AGENT_ID');
@@ -155,7 +166,7 @@ function saveState(callSid, updater) {
 function buildGatherTwiML(prompt, nextPath) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech dtmf" action="${xmlEscape(nextPath)}" method="POST" timeout="8" speechTimeout="auto" actionOnEmptyResult="true">
+  <Gather input="speech" action="${xmlEscape(nextPath)}" method="POST" timeout="${xmlEscape(gatherTimeout)}" speechTimeout="${xmlEscape(gatherSpeechTimeout)}" speechModel="${xmlEscape(gatherSpeechModel)}" actionOnEmptyResult="true">
     <Say voice="${xmlEscape(selectedVoice)}" language="${xmlEscape(selectedLanguage)}">${xmlEscape(prompt)}</Say>
   </Gather>
 </Response>`;
@@ -957,6 +968,7 @@ function buildTurnPrompt(state, callerText) {
     'Speak naturally and keep each question short.',
     'Ask exactly one question at a time.',
     'Do not ask about protected characteristics.',
+    'If the caller answer seems unclear, incomplete, or noisy, ask them to repeat it once before moving on.',
     `Prospect name: ${state.prospectName || 'unknown'}.`,
     `Property: ${state.propertyName || 'unknown'}.`,
   ];
@@ -1043,6 +1055,16 @@ function validateTwilioRequest(req) {
 
 function parseRequestText(req) {
   return normalizeText(req.body.SpeechResult || req.body.Digits || '');
+}
+
+function parseSpeechConfidence(req) {
+  const value = req.body?.Confidence ?? req.body?.confidence;
+  if (value == null || value === '') {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function getProspectAndProperty(req) {
@@ -1209,6 +1231,7 @@ app.post('/voice/turn', async (req, res) => {
     }
 
     const callerText = parseRequestText(req);
+    const confidence = parseSpeechConfidence(req);
     const { prospectName, propertyName } = getProspectAndProperty(req);
     let state = getState(callSid);
 
@@ -1224,6 +1247,14 @@ app.post('/voice/turn', async (req, res) => {
 
     if (!callerText) {
       const reprompt = state.lastAgentMessage || 'Sorry, I did not catch that. Please answer again.';
+      res.type('text/xml').send(buildGatherTwiML(reprompt, '/voice/turn'));
+      return;
+    }
+
+    if (confidence !== null && confidence < lowConfidenceThreshold) {
+      const reprompt =
+        state.lastAgentMessage ||
+        'Sorry, that was hard to hear. Please repeat your answer slowly and clearly.';
       res.type('text/xml').send(buildGatherTwiML(reprompt, '/voice/turn'));
       return;
     }
