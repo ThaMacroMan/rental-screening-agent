@@ -3,7 +3,6 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-MCP_PORT="${MCP_PORT:-8000}"
 VOICE_PORT="${VOICE_PORT:-8002}"
 PROXY_PORT="${PROXY_PORT:-${PORT:-8080}}"
 RUNTIME_DIR="${RUNTIME_DIR:-/data}"
@@ -22,7 +21,6 @@ fi
 
 mkdir -p "$RUNTIME_DIR"
 
-export MCP_PORT
 export VOICE_PORT
 export PROXY_PORT
 export APP_BASE_URL="$APP_BASE_URL"
@@ -41,33 +39,24 @@ fs.mkdirSync(path.dirname(runtimeFile), { recursive: true });
 fs.writeFileSync(runtimeFile, `${JSON.stringify({
   appBaseUrl,
   publicBaseUrl: appBaseUrl,
-  mcpUrl: `${appBaseUrl}/mcp`,
   voiceStartUrl: `${appBaseUrl}/voice/start`,
-  voiceTurnUrl: `${appBaseUrl}/voice/turn`,
   voiceStateUrl: `${appBaseUrl}/voice/state`,
   updatedAt: new Date().toISOString(),
 }, null, 2)}\n`);
 NODE
 
 cleanup() {
-  kill "${MCP_PID:-}" "${PROXY_PID:-}" "${VOICE_PID:-}" 2>/dev/null || true
+  kill "${PROXY_PID:-}" "${VOICE_PID:-}" 2>/dev/null || true
 }
 
 trap cleanup EXIT INT TERM
-
-echo "Starting tenant screening MCP server on port ${MCP_PORT}..."
-"$ROOT_DIR/node_modules/.bin/supergateway" \
-  --port "${MCP_PORT}" \
-  --outputTransport streamableHttp \
-  --stdio "node ${ROOT_DIR}/tenant-screening-mcp.js" &
-MCP_PID=$!
-
-echo "Starting voice bridge on port ${VOICE_PORT}..."
-node "$ROOT_DIR/voice-bridge.js" &
-VOICE_PID=$!
 
 echo "Starting proxy on port ${PROXY_PORT}..."
 node "$ROOT_DIR/mcp-auth-proxy.js" &
 PROXY_PID=$!
 
-wait -n "$MCP_PID" "$VOICE_PID" "$PROXY_PID"
+echo "Starting voice bridge on port ${VOICE_PORT}..."
+node "$ROOT_DIR/voice-bridge.js" &
+VOICE_PID=$!
+
+wait -n "$VOICE_PID" "$PROXY_PID"

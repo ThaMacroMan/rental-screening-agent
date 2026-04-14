@@ -2,9 +2,8 @@
   "name": "voiceagentautomation",
   "version": "1.0.0",
   "description": "",
-  "main": "tenant-screening-mcp.js",
+  "main": "voice-bridge.js",
   "scripts": {
-    "start:mcp": "./start-mcp-server.sh",
     "start:prod": "./start-production.sh",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -17,8 +16,8 @@
     "http-proxy": "^1.18.1",
     "http-proxy-middleware": "^3.0.5",
     "nodemailer": "^6.10.1",
-    "supergateway": "^3.4.3",
     "twilio": "^5.13.1",
+    "ws": "^8.20.0",
     "zod": "^4.3.6"
   }
 }

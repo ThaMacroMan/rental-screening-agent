@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 
-const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const nodemailer = require('nodemailer');
-const twilio = require('twilio');
+const http = require("http");
+const express = require("express");
+const fs = require("fs");
+const path = require("path");
+const nodemailer = require("nodemailer");
+const { WebSocketServer, WebSocket } = require("ws");
+const twilio = require("twilio");
 
 function requiredEnv(name) {
   const value = process.env[name];
@@ -14,63 +16,208 @@ function requiredEnv(name) {
   return value;
 }
 
-const anthropicApiKey = requiredEnv('ANTHROPIC_API_KEY');
-const agentId = process.env.VOICE_AGENT_ID || process.env.AGENT_ID;
-const environmentId = requiredEnv('ENVIRONMENT_ID');
-const twilioAuthToken = requiredEnv('TWILIO_AUTH_TOKEN');
-const twilioAccountSid = requiredEnv('TWILIO_ACCOUNT_SID');
-const twilioFromNumber = requiredEnv('TWILIO_FROM_NUMBER');
+const openaiApiKey = requiredEnv("OPENAI_API_KEY");
+const twilioAuthToken = requiredEnv("TWILIO_AUTH_TOKEN");
+const twilioAccountSid = requiredEnv("TWILIO_ACCOUNT_SID");
+const twilioFromNumber = requiredEnv("TWILIO_FROM_NUMBER");
 const defaultFromNumber = twilioFromNumber;
-const gatherSpeechModel = process.env.TWILIO_GATHER_SPEECH_MODEL || 'phone_call';
+const openaiRealtimeModel = normalizeText(
+  process.env.OPENAI_REALTIME_MODEL || "gpt-realtime",
+);
+const openaiRealtimeVoice = normalizeText(
+  process.env.OPENAI_REALTIME_VOICE || "marin",
+);
+const openaiRealtimeInputLanguage = normalizeText(
+  process.env.OPENAI_REALTIME_INPUT_LANGUAGE || "en",
+);
 
 function readPositiveNumberEnv(name, fallback) {
   const parsed = Number(process.env[name]);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-const gatherSpeechTimeout = readPositiveNumberEnv('TWILIO_GATHER_SPEECH_TIMEOUT', 5);
-const gatherTimeout = readPositiveNumberEnv('TWILIO_GATHER_TIMEOUT', 10);
-const lowConfidenceThreshold = readPositiveNumberEnv('TWILIO_GATHER_LOW_CONFIDENCE_THRESHOLD', 0.58);
+const openaiRealtimeIdleTimeoutMs = readPositiveNumberEnv(
+  "OPENAI_REALTIME_IDLE_TIMEOUT_MS",
+  5000,
+);
+const openaiRealtimeResponseTimeoutMs = readPositiveNumberEnv(
+  "OPENAI_REALTIME_RESPONSE_TIMEOUT_MS",
+  20000,
+);
+const openaiRealtimeSpeechThreshold = Number(
+  process.env.OPENAI_REALTIME_SPEECH_THRESHOLD || 0.9,
+);
+const openaiRealtimeSilenceDurationMs = readPositiveNumberEnv(
+  "OPENAI_REALTIME_SILENCE_DURATION_MS",
+  500,
+);
+const openaiRealtimePrefixPaddingMs = readPositiveNumberEnv(
+  "OPENAI_REALTIME_PREFIX_PADDING_MS",
+  400,
+);
+const openaiRealtimeResponseDelayMs = readPositiveNumberEnv(
+  "OPENAI_REALTIME_RESPONSE_DELAY_MS",
+  2000,
+);
+const maxUnclearAttempts = readPositiveNumberEnv(
+  "TWILIO_GATHER_MAX_UNCLEAR_ATTEMPTS",
+  3,
+);
 
-if (!agentId) {
-  throw new Error('Missing required environment variable: VOICE_AGENT_ID or AGENT_ID');
-}
+const SCREENING_GOALS = [
+  {
+    key: "employment_income",
+    label: "Employment and income",
+    guidance:
+      "Confirm current employment or income source and enough detail to judge rent affordability.",
+  },
+  {
+    key: "move_in_timeline",
+    label: "Move-in timeline and lease",
+    guidance:
+      "Confirm when they want to move in and what kind of lease term they want.",
+  },
+  {
+    key: "rental_history_references",
+    label: "Rental history and references",
+    guidance:
+      "Confirm recent rental history and whether they can provide landlord or character references.",
+  },
+];
 
-const runtimePath = process.env.VOICE_RUNTIME_PATH || path.join(__dirname, '.runtime', 'runtime.json');
-const statePath = process.env.VOICE_STATE_PATH || path.join(__dirname, '.runtime', 'tenant-screening-state.json');
-const appBaseUrl = (process.env.APP_BASE_URL || process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
+const OPENAI_TOOLS = [
+  {
+    type: "function",
+    name: "record_screening_update",
+    description:
+      "Record the caller answer for the current screening goal and decide whether it is partial or complete.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        goal: {
+          type: "string",
+          enum: SCREENING_GOALS.map((goal) => goal.key),
+        },
+        status: {
+          type: "string",
+          enum: ["open", "partial", "complete"],
+        },
+        notes: {
+          type: "string",
+        },
+        captured_answer: {
+          type: "string",
+        },
+        next_goal: {
+          type: ["string", "null"],
+          enum: [...SCREENING_GOALS.map((goal) => goal.key), null],
+        },
+      },
+      required: ["goal", "status", "notes", "captured_answer"],
+    },
+  },
+  {
+    type: "function",
+    name: "finish_screening",
+    description:
+      "Mark the screening as finished once all goals are complete or the caller is no longer suitable for automated screening.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        summary: {
+          type: "string",
+        },
+        disposition: {
+          type: "string",
+          enum: ["complete", "needs_review", "unable_to_complete"],
+        },
+        flags: {
+          type: "array",
+          items: {
+            type: "string",
+          },
+        },
+      },
+      required: ["summary", "disposition"],
+    },
+  },
+  {
+    type: "function",
+    name: "escalate_to_human",
+    description:
+      "Hand the call off to a human when the caller is unclear or the flow cannot continue.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        reason: {
+          type: "string",
+        },
+        summary: {
+          type: "string",
+        },
+      },
+      required: ["reason", "summary"],
+    },
+  },
+];
+
+const runtimePath =
+  process.env.VOICE_RUNTIME_PATH ||
+  path.join(__dirname, ".runtime", "runtime.json");
+const statePath =
+  process.env.VOICE_STATE_PATH ||
+  path.join(__dirname, ".runtime", "tenant-screening-state.json");
+const appBaseUrl = (
+  process.env.APP_BASE_URL ||
+  process.env.PUBLIC_BASE_URL ||
+  ""
+).replace(/\/$/, "");
 // Voice options for quick switching:
 // const defaultVoice = process.env.TWILIO_TTS_VOICE || 'Polly.Joanna-Generative';
 // const defaultVoice = process.env.TWILIO_TTS_VOICE || 'Google.en-US-Chirp3-HD-Aoede';
 // const defaultVoice = process.env.TWILIO_TTS_VOICE || 'Polly.Joanna-Neural';
 // const defaultVoice = process.env.TWILIO_TTS_VOICE || 'Polly.Joanna';
-const defaultVoice = process.env.TWILIO_TTS_VOICE || 'Polly.Joanna-Generative';
-const fallbackVoice = process.env.TWILIO_TTS_VOICE_FALLBACK || 'Polly.Joanna-Neural';
-const selectedVoice = process.env.TWILIO_TTS_USE_FALLBACK === 'true' ? fallbackVoice : defaultVoice;
-const selectedLanguage = process.env.TWILIO_TTS_LANGUAGE || 'en-US';
-console.log(`[voice-bridge] Twilio TTS voice: ${selectedVoice} (fallback: ${fallbackVoice}, language: ${selectedLanguage})`);
-const summaryEmailTo = process.env.SUMMARY_EMAIL_TO || 'joshkuski@gmail.com';
-const summaryEmailFrom = process.env.SUMMARY_EMAIL_FROM || process.env.SMTP_FROM || process.env.SMTP_USER || 'tenant-screening@localhost';
-const smtpUrl = process.env.SMTP_URL || '';
-const smtpHost = process.env.SMTP_HOST || '';
-const smtpPort = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : undefined;
-const smtpSecure = process.env.SMTP_SECURE === 'true';
-const smtpUser = process.env.SMTP_USER || '';
-const smtpPass = process.env.SMTP_PASS || '';
+const defaultVoice = process.env.TWILIO_TTS_VOICE || "Polly.Joanna-Generative";
+const fallbackVoice =
+  process.env.TWILIO_TTS_VOICE_FALLBACK || "Polly.Joanna-Neural";
+const selectedVoice =
+  process.env.TWILIO_TTS_USE_FALLBACK === "true" ? fallbackVoice : defaultVoice;
+const selectedLanguage = process.env.TWILIO_TTS_LANGUAGE || "en-US";
+console.log(
+  `[voice-bridge] Twilio TTS voice: ${selectedVoice} (fallback: ${fallbackVoice}, language: ${selectedLanguage})`,
+);
+const summaryEmailTo = process.env.SUMMARY_EMAIL_TO || "joshkuski@gmail.com";
+const summaryEmailFrom =
+  process.env.SUMMARY_EMAIL_FROM ||
+  process.env.SMTP_FROM ||
+  process.env.SMTP_USER ||
+  "tenant-screening@localhost";
+const smtpUrl = process.env.SMTP_URL || "";
+const smtpHost = process.env.SMTP_HOST || "";
+const smtpPort = process.env.SMTP_PORT
+  ? Number(process.env.SMTP_PORT)
+  : undefined;
+const smtpSecure = process.env.SMTP_SECURE === "true";
+const smtpUser = process.env.SMTP_USER || "";
+const smtpPass = process.env.SMTP_PASS || "";
 const twilioClient = twilio(twilioAccountSid, twilioAuthToken);
 
 const app = express();
-app.set('trust proxy', true);
+app.set("trust proxy", true);
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+const server = http.createServer(app);
 
 function xmlEscape(value) {
   return String(value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 function ensureParentDir(filePath) {
@@ -79,7 +226,7 @@ function ensureParentDir(filePath) {
 
 function readJsonFile(filePath, fallback) {
   try {
-    const raw = fs.readFileSync(filePath, 'utf8');
+    const raw = fs.readFileSync(filePath, "utf8");
     return JSON.parse(raw);
   } catch {
     return fallback;
@@ -94,12 +241,12 @@ function atomicWriteJson(filePath, value) {
 }
 
 function normalizeText(value) {
-  return String(value || '').trim();
+  return String(value || "").trim();
 }
 
 function loadRuntimeConfig() {
   const runtime = readJsonFile(runtimePath, null);
-  if (!runtime || typeof runtime !== 'object') {
+  if (!runtime || typeof runtime !== "object") {
     return null;
   }
   return runtime;
@@ -109,11 +256,15 @@ function loadStateStore() {
   const fallback = { version: 1, updatedAt: null, calls: {} };
   const stored = readJsonFile(statePath, fallback);
 
-  if (!stored || typeof stored !== 'object') {
+  if (!stored || typeof stored !== "object") {
     return fallback;
   }
 
-  if (stored.calls && typeof stored.calls === 'object' && !Array.isArray(stored.calls)) {
+  if (
+    stored.calls &&
+    typeof stored.calls === "object" &&
+    !Array.isArray(stored.calls)
+  ) {
     return {
       version: stored.version || 1,
       updatedAt: stored.updatedAt || null,
@@ -137,6 +288,7 @@ function loadStateStore() {
 
 const stateStore = loadStateStore();
 const callState = new Map(Object.entries(stateStore.calls || {}));
+const realtimeSessions = new Map();
 
 function persistStateStore() {
   atomicWriteJson(statePath, {
@@ -163,6 +315,14 @@ function saveState(callSid, updater) {
   return next;
 }
 
+function isTerminalState(state) {
+  return (
+    state?.status === "completed" ||
+    state?.status === "terminated" ||
+    state?.status === "failed"
+  );
+}
+
 function buildGatherTwiML(prompt, nextPath) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -181,7 +341,10 @@ function buildSayAndHangupTwiML(prompt) {
 }
 
 function buildClosingMessage(state) {
-  const name = state?.prospectName || 'there';
+  const name = state?.prospectName || "there";
+  if (state?.endReason === "too_many_unclear_responses") {
+    return `I'm having trouble hearing you, ${name}. Please call back from a quieter place. Goodbye.`;
+  }
   return `Thank you, ${name}. Someone from our team will follow up soon. Goodbye.`;
 }
 
@@ -201,14 +364,20 @@ function createMailTransport() {
 
   return nodemailer.createTransport({
     sendmail: true,
-    newline: 'unix',
-    path: '/usr/sbin/sendmail',
+    newline: "unix",
+    path: "/usr/sbin/sendmail",
   });
 }
 
 function getRuntimeBaseUrl() {
   const runtime = loadRuntimeConfig();
-  return runtime?.appBaseUrl || runtime?.publicBaseUrl || process.env.VOICE_PUBLIC_BASE_URL || process.env.APP_BASE_URL || '';
+  return (
+    runtime?.appBaseUrl ||
+    runtime?.publicBaseUrl ||
+    process.env.VOICE_PUBLIC_BASE_URL ||
+    process.env.APP_BASE_URL ||
+    ""
+  );
 }
 
 function resolveScreeningUrl(args) {
@@ -219,18 +388,30 @@ function resolveScreeningUrl(args) {
 
   const baseUrl = getRuntimeBaseUrl();
   if (!baseUrl) {
-    throw new Error('Provide screeningUrl or start the launcher first so the live voice URL is available.');
+    throw new Error(
+      "Provide screeningUrl or start the launcher first so the live voice URL is available.",
+    );
   }
 
-  return new URL('/voice/start', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
+  return new URL(
+    "/voice/start",
+    baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`,
+  );
 }
 
 function parseBooleanField(value) {
-  if (value === true || value === 'true' || value === 'on' || value === '1') {
+  if (value === true || value === "true" || value === "on" || value === "1") {
     return true;
   }
 
-  if (value === false || value === 'false' || value === 'off' || value === '0' || value === '' || value == null) {
+  if (
+    value === false ||
+    value === "false" ||
+    value === "off" ||
+    value === "0" ||
+    value === "" ||
+    value == null
+  ) {
     return false;
   }
 
@@ -238,7 +419,7 @@ function parseBooleanField(value) {
 }
 
 function parseIntegerField(value, fieldName, { min, max } = {}) {
-  if (value == null || value === '') {
+  if (value == null || value === "") {
     return null;
   }
 
@@ -247,11 +428,11 @@ function parseIntegerField(value, fieldName, { min, max } = {}) {
     throw new Error(`${fieldName} must be an integer.`);
   }
 
-  if (typeof min === 'number' && parsed < min) {
+  if (typeof min === "number" && parsed < min) {
     throw new Error(`${fieldName} must be at least ${min}.`);
   }
 
-  if (typeof max === 'number' && parsed > max) {
+  if (typeof max === "number" && parsed > max) {
     throw new Error(`${fieldName} must be at most ${max}.`);
   }
 
@@ -266,11 +447,13 @@ function buildOutboundCallParams(args) {
   const screeningTwiml = normalizeText(args.screeningTwiml);
 
   if (!to) {
-    throw new Error('Destination phone number is required.');
+    throw new Error("Destination phone number is required.");
   }
 
   if (!from) {
-    throw new Error('No caller ID available. Set TWILIO_FROM_NUMBER or pass from explicitly.');
+    throw new Error(
+      "No caller ID available. Set TWILIO_FROM_NUMBER or pass from explicitly.",
+    );
   }
 
   const params = {
@@ -282,25 +465,33 @@ function buildOutboundCallParams(args) {
   if (normalizeText(args.screeningUrl) || getRuntimeBaseUrl()) {
     const screeningUrl = resolveScreeningUrl(args);
     if (prospectName) {
-      screeningUrl.searchParams.set('prospectName', prospectName);
+      screeningUrl.searchParams.set("prospectName", prospectName);
     }
     if (propertyName) {
-      screeningUrl.searchParams.set('propertyName', propertyName);
+      screeningUrl.searchParams.set("propertyName", propertyName);
     }
     params.url = screeningUrl.toString();
   } else if (screeningTwiml) {
     params.twiml = screeningTwiml;
   } else {
-    throw new Error('Provide screeningUrl or screeningTwiml.');
+    throw new Error("Provide screeningUrl or screeningTwiml.");
   }
 
   const statusCallback = normalizeText(args.statusCallback);
   if (statusCallback) {
     params.statusCallback = statusCallback;
-    params.statusCallbackEvent = ['initiated', 'ringing', 'answered', 'completed'];
+    params.statusCallbackEvent = [
+      "initiated",
+      "ringing",
+      "answered",
+      "completed",
+    ];
   }
 
-  const timeout = parseIntegerField(args.timeout, 'timeout', { min: 5, max: 600 });
+  const timeout = parseIntegerField(args.timeout, "timeout", {
+    min: 5,
+    max: 600,
+  });
   if (timeout !== null) {
     params.timeout = timeout;
   }
@@ -313,11 +504,52 @@ function buildOutboundCallParams(args) {
   return params;
 }
 
+function getVoiceStreamWebSocketUrl() {
+  const baseUrl = getRuntimeBaseUrl();
+  if (!baseUrl) {
+    throw new Error(
+      "Missing public base URL. Set APP_BASE_URL so Twilio can reach the websocket bridge.",
+    );
+  }
+
+  const streamUrl = new URL(
+    "/voice/stream",
+    baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`,
+  );
+  streamUrl.protocol = streamUrl.protocol === "https:" ? "wss:" : "ws:";
+  return streamUrl.toString();
+}
+
+function buildConnectStreamTwiML(callSid, prospectName, propertyName) {
+  const streamUrl = getVoiceStreamWebSocketUrl();
+  const parameters = [
+    ["callSid", callSid],
+    ["prospectName", prospectName],
+    ["propertyName", propertyName],
+  ].filter(([, value]) => normalizeText(value));
+
+  const parameterXml = parameters
+    .map(
+      ([name, value]) =>
+        `      <Parameter name="${xmlEscape(name)}" value="${xmlEscape(value)}"/>`,
+    )
+    .join("\n");
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="${xmlEscape(streamUrl)}">
+${parameterXml ? `${parameterXml}\n` : ""}    </Stream>
+  </Connect>
+</Response>`;
+}
+
 function renderTestingPage() {
   const runtime = loadRuntimeConfig();
   const baseUrl = getRuntimeBaseUrl();
-  const defaultScreeningUrl = runtime?.voiceStartUrl || (baseUrl ? `${baseUrl}/voice/start` : '');
-  const configuredFromNumber = defaultFromNumber || '';
+  const defaultScreeningUrl =
+    runtime?.voiceStartUrl || (baseUrl ? `${baseUrl}/voice/start` : "");
+  const configuredFromNumber = defaultFromNumber || "";
   const context = {
     baseUrl: baseUrl || null,
     voiceStartUrl: runtime?.voiceStartUrl || null,
@@ -326,7 +558,7 @@ function renderTestingPage() {
     statePath,
   };
 
-  const contextJson = JSON.stringify(context).replace(/</g, '\\u003c');
+  const contextJson = JSON.stringify(context).replace(/</g, "\\u003c");
 
   return `<!doctype html>
 <html lang="en">
@@ -838,22 +1070,28 @@ function renderTestingPage() {
 function buildEmailText(state) {
   const answers = Array.isArray(state.answers) ? state.answers : [];
   const lines = [];
-  lines.push(`Tenant screening summary for ${state.prospectName || 'unknown prospect'}`);
-  lines.push(`Property: ${state.propertyName || 'unknown property'}`);
+  lines.push(
+    `Tenant screening summary for ${state.prospectName || "unknown prospect"}`,
+  );
+  lines.push(`Property: ${state.propertyName || "unknown property"}`);
   lines.push(`Call SID: ${state.callSid}`);
-  lines.push('');
-  lines.push(state.summary || state.lastAgentMessage || 'No summary available.');
-  lines.push('');
-  lines.push('Answers:');
+  lines.push("");
+  lines.push(
+    state.summary || state.lastAgentMessage || "No summary available.",
+  );
+  lines.push("");
+  lines.push("Answers:");
   for (const answer of answers) {
-    lines.push(`${answer.questionNumber}. ${answer.answer}`);
+    const label =
+      answer.goalLabel || answer.goalKey || `Question ${answer.questionNumber}`;
+    lines.push(`${label}: ${answer.answer}`);
   }
-  return lines.join('\n');
+  return lines.join("\n");
 }
 
 async function sendSummaryEmail(callSid) {
   const state = getState(callSid);
-  if (!state || state.status !== 'completed') {
+  if (!state || state.status !== "completed") {
     return;
   }
 
@@ -861,7 +1099,7 @@ async function sendSummaryEmail(callSid) {
   if (!transport) {
     saveState(callSid, (current) => ({
       ...current,
-      emailStatus: 'skipped_no_transport',
+      emailStatus: "skipped_no_transport",
       emailTo: summaryEmailTo,
       emailError: null,
     }));
@@ -871,9 +1109,9 @@ async function sendSummaryEmail(callSid) {
   if (!summaryEmailFrom) {
     saveState(callSid, (current) => ({
       ...current,
-      emailStatus: 'failed',
+      emailStatus: "failed",
       emailTo: summaryEmailTo,
-      emailError: 'Missing SUMMARY_EMAIL_FROM or SMTP_FROM/SMTP_USER',
+      emailError: "Missing SUMMARY_EMAIL_FROM or SMTP_FROM/SMTP_USER",
     }));
     return;
   }
@@ -882,13 +1120,13 @@ async function sendSummaryEmail(callSid) {
     const info = await transport.sendMail({
       from: summaryEmailFrom,
       to: summaryEmailTo,
-      subject: `Tenant screening summary: ${state.prospectName || 'Unknown prospect'}`,
+      subject: `Tenant screening summary: ${state.prospectName || "Unknown prospect"}`,
       text: buildEmailText(state),
     });
 
     saveState(callSid, (current) => ({
       ...current,
-      emailStatus: 'sent',
+      emailStatus: "sent",
       emailTo: summaryEmailTo,
       emailMessageId: info.messageId || null,
       emailSentAt: new Date().toISOString(),
@@ -897,23 +1135,776 @@ async function sendSummaryEmail(callSid) {
   } catch (error) {
     saveState(callSid, (current) => ({
       ...current,
-      emailStatus: 'failed',
+      emailStatus: "failed",
       emailTo: summaryEmailTo,
       emailError: error.message,
     }));
-    console.error('Failed to send screening summary email:', error);
+    console.error("Failed to send screening summary email:", error);
+  }
+}
+
+function buildScreeningGoalSnapshot(state) {
+  const currentGoalKey =
+    state.currentGoalKey ||
+    getNextOpenGoalKey(state.goals) ||
+    SCREENING_GOALS[0].key;
+  const currentGoal = getGoalByKey(currentGoalKey) || SCREENING_GOALS[0];
+  const goalState = SCREENING_GOALS.map((goal) => ({
+    goal: goal.key,
+    label: goal.label,
+    status: state.goals?.[goal.key]?.status || "open",
+    notes: state.goals?.[goal.key]?.notes || "",
+  }));
+
+  return {
+    prospect_name: state.prospectName || "unknown",
+    property_name: state.propertyName || "unknown",
+    current_goal: {
+      key: currentGoal.key,
+      label: currentGoal.label,
+      guidance: currentGoal.guidance,
+      status: state.goals?.[currentGoal.key]?.status || "open",
+      notes: state.goals?.[currentGoal.key]?.notes || "",
+    },
+    completed_goals: goalState.filter((goal) => goal.status === "complete"),
+    goal_state: goalState,
+    latest_caller_transcript: state.lastUserMessage || null,
+    last_question_asked: state.lastAgentMessage || null,
+    prior_answers: (state.answers || []).slice(-5).map((answer) => ({
+      goal: answer.goalKey,
+      answer: answer.answer,
+    })),
+  };
+}
+
+function buildRealtimeInstructions(state) {
+  const snapshot = buildScreeningGoalSnapshot(state);
+  return [
+    "You are conducting a live tenant screening phone interview over a real-time phone call.",
+    "Keep the conversation warm, concise, and natural.",
+    "Wait for the caller to speak first before you say anything.",
+    "When the caller first says hello or starts speaking, briefly greet them and then begin the screening.",
+    "Ask exactly one question at a time.",
+    "The caller audio may be imperfect, so if an answer seems partial or noisy, ask one short clarification instead of moving on.",
+    "Do not ask about protected characteristics.",
+    "Use the tools when you have enough information to record a screening update, finish the screening, or escalate to a human.",
+    "When the current goal is answered well enough, call record_screening_update before continuing.",
+    "When all goals are complete, call finish_screening.",
+    "When the caller is not understandable after a couple of attempts or refuses to continue, call escalate_to_human.",
+    `Current call state: ${JSON.stringify(snapshot)}`,
+  ].join("\n");
+}
+
+function buildOpenAISessionUpdate(state) {
+  const turnDetection = {
+    type: "server_vad",
+    create_response: false,
+    interrupt_response: true,
+    idle_timeout_ms: openaiRealtimeIdleTimeoutMs,
+    prefix_padding_ms: openaiRealtimePrefixPaddingMs,
+    silence_duration_ms: openaiRealtimeSilenceDurationMs,
+  };
+
+  if (Number.isFinite(openaiRealtimeSpeechThreshold)) {
+    turnDetection.threshold = openaiRealtimeSpeechThreshold;
+  }
+
+  return {
+    type: "session.update",
+    session: {
+      type: "realtime",
+      instructions: buildRealtimeInstructions(state),
+      tool_choice: "auto",
+      audio: {
+        input: {
+          format: { type: "audio/pcmu" },
+          turn_detection: turnDetection,
+          transcription: {
+            model: "gpt-4o-mini-transcribe",
+            language: openaiRealtimeInputLanguage,
+          },
+        },
+        output: {
+          format: { type: "audio/pcmu" },
+          voice: openaiRealtimeVoice,
+        },
+      },
+      tools: OPENAI_TOOLS,
+    },
+  };
+}
+
+function getRealtimeSession(callSid) {
+  let session = realtimeSessions.get(callSid);
+  if (session) {
+    return session;
+  }
+
+  session = {
+    callSid,
+    streamSid: null,
+    twilioSocket: null,
+    openaiSocket: null,
+    openaiReady: false,
+    initialResponseSent: false,
+    pendingTwilioAudio: [],
+    pendingHangup: false,
+    pendingMarkName: null,
+    assistantSpeaking: false,
+    closed: false,
+    closeReason: null,
+    lastResponseId: null,
+    toolCallCounter: 0,
+    handledToolCallIds: new Set(),
+    responseInProgress: false,
+    hangupTimer: null,
+    responseDebounceTimer: null,
+    callLog: [],
+    callStartedAt: new Date(),
+  };
+
+  realtimeSessions.set(callSid, session);
+  return session;
+}
+
+function callTag(session) {
+  return `[call:${session.callSid?.slice(-6) || "???"}]`;
+}
+
+function looksIncomplete(transcript) {
+  const t = transcript.toLowerCase().trim();
+  if (!t) return false;
+
+  // Ends with filler words or trailing connectors — user is mid-thought
+  const trailingPatterns = /\b(uh|um|and|or|but|so|like|the|a|an|for|about|to|of|in|my|i|is|was|that|with|from|at|on|it|just|you know|i mean|well|basically|actually|i'm|i've|we|let me|i got|looking)\s*\.{0,3}$/;
+  if (trailingPatterns.test(t)) return true;
+
+  // Very short fragments (fewer than 4 real words) are likely incomplete
+  const words = t.split(/\s+/).filter(w => w.length > 0);
+  if (words.length <= 3 && !/[.!?]$/.test(t)) return true;
+
+  return false;
+}
+
+function logCall(session, message) {
+  const ts = new Date().toISOString();
+  console.log(`${callTag(session)} ${message}`);
+  if (session.callLog) {
+    session.callLog.push({ ts, message });
+  }
+}
+
+function sendTwilioJson(session, payload) {
+  if (
+    !session.twilioSocket ||
+    session.twilioSocket.readyState !== WebSocket.OPEN
+  ) {
+    return;
+  }
+
+  if (payload.event === "clear") {
+    logCall(session, ">> twilio: clear audio buffer");
+  } else if (payload.event === "mark") {
+    logCall(session, `>> twilio: mark "${payload.mark?.name}"`);
+  }
+
+  session.twilioSocket.send(JSON.stringify(payload));
+}
+
+function sendOpenAIJson(session, payload) {
+  if (
+    !session.openaiSocket ||
+    session.openaiSocket.readyState !== WebSocket.OPEN
+  ) {
+    return;
+  }
+
+  if (payload.type !== "input_audio_buffer.append") {
+    logCall(session, `>> openai: ${payload.type}`);
+  }
+
+  session.openaiSocket.send(JSON.stringify(payload));
+}
+
+function flushPendingTwilioAudio(session) {
+  if (
+    !session.openaiSocket ||
+    session.openaiSocket.readyState !== WebSocket.OPEN
+  ) {
+    return;
+  }
+
+  while (session.pendingTwilioAudio.length > 0) {
+    const audio = session.pendingTwilioAudio.shift();
+    sendOpenAIJson(session, {
+      type: "input_audio_buffer.append",
+      audio,
+    });
+  }
+}
+
+function formatCallLogEmail(session) {
+  const state = getState(session.callSid) || {};
+  const duration = session.callStartedAt
+    ? Math.round((Date.now() - session.callStartedAt.getTime()) / 1000)
+    : 0;
+  const mins = Math.floor(duration / 60);
+  const secs = duration % 60;
+
+  const lines = [];
+  lines.push("═══════════════════════════════════════════════════");
+  lines.push(`  CALL LOG: ${state.prospectName || "Unknown"}`);
+  lines.push("═══════════════════════════════════════════════════");
+  lines.push("");
+  lines.push(`Call SID:     ${session.callSid}`);
+  lines.push(`Prospect:     ${state.prospectName || "unknown"}`);
+  lines.push(`Property:     ${state.propertyName || "unknown"}`);
+  lines.push(`Duration:     ${mins}m ${secs}s`);
+  lines.push(`Status:       ${state.status || "unknown"}`);
+  lines.push(`End reason:   ${session.closeReason || state.endReason || "unknown"}`);
+  lines.push(`Started:      ${session.callStartedAt?.toISOString() || "?"}`);
+  lines.push(`Ended:        ${new Date().toISOString()}`);
+  lines.push("");
+
+  // Screening results
+  if (state.answers && state.answers.length > 0) {
+    lines.push("───────────────────────────────────────────────────");
+    lines.push("  SCREENING RESULTS");
+    lines.push("───────────────────────────────────────────────────");
+    for (const answer of state.answers) {
+      const label = answer.goalLabel || answer.goalKey || `Q${answer.questionNumber}`;
+      lines.push(`  ${label}: ${answer.answer}`);
+    }
+    if (state.summary) {
+      lines.push("");
+      lines.push(`  Summary: ${state.summary}`);
+    }
+    lines.push("");
+  }
+
+  // Event timeline
+  lines.push("───────────────────────────────────────────────────");
+  lines.push("  EVENT TIMELINE");
+  lines.push("───────────────────────────────────────────────────");
+  for (const entry of session.callLog || []) {
+    const time = entry.ts.slice(11, 23); // HH:MM:SS.mmm
+    const msg = entry.message;
+
+    // Add visual markers for key events
+    let prefix = "  ";
+    if (msg.includes("user transcript:")) prefix = "🎤";
+    else if (msg.includes("agent said:")) prefix = "🔊";
+    else if (msg.includes("tool:") && msg.includes("handling")) prefix = "🔧";
+    else if (msg.includes("interrupting")) prefix = "⚡";
+    else if (msg.includes("ERROR")) prefix = "❌";
+
+    lines.push(`${prefix} ${time}  ${msg}`);
+  }
+  lines.push("");
+  lines.push("═══════════════════════════════════════════════════");
+
+  return lines.join("\n");
+}
+
+async function sendCallLogEmail(session) {
+  try {
+    const transport = createMailTransport();
+    if (!transport) return;
+    if (!summaryEmailFrom) return;
+
+    const state = getState(session.callSid) || {};
+    const prospect = state.prospectName || "Unknown";
+    const status = state.status || "unknown";
+
+    await transport.sendMail({
+      from: summaryEmailFrom,
+      to: summaryEmailTo,
+      subject: `Call log: ${prospect} [${status}]`,
+      text: formatCallLogEmail(session),
+    });
+  } catch (error) {
+    console.error("Failed to send call log email:", error);
+  }
+}
+
+function closeRealtimeSession(callSid, reason) {
+  const session = realtimeSessions.get(callSid);
+  if (!session || session.closed) {
+    return;
+  }
+
+  logCall(session, `closing session reason="${reason}"`);
+  session.closed = true;
+  session.closeReason = reason || session.closeReason || null;
+
+  if (session.hangupTimer) {
+    clearTimeout(session.hangupTimer);
+    session.hangupTimer = null;
+  }
+
+  if (session.responseDebounceTimer) {
+    clearTimeout(session.responseDebounceTimer);
+    session.responseDebounceTimer = null;
+  }
+
+  if (
+    session.openaiSocket &&
+    session.openaiSocket.readyState === WebSocket.OPEN
+  ) {
+    session.openaiSocket.close();
+  }
+
+  if (
+    session.twilioSocket &&
+    session.twilioSocket.readyState === WebSocket.OPEN
+  ) {
+    session.twilioSocket.close();
+  }
+
+  void sendCallLogEmail(session);
+  realtimeSessions.delete(callSid);
+}
+
+function scheduleHangup(callSid, delayMs = 1200) {
+  const session = realtimeSessions.get(callSid);
+  if (!session || session.hangupTimer) {
+    return;
+  }
+
+  logCall(session, `scheduling hangup in ${delayMs}ms`);
+  session.hangupTimer = setTimeout(async () => {
+    session.hangupTimer = null;
+    logCall(session, "executing hangup");
+    try {
+      await twilioClient.calls(callSid).update({ status: "completed" });
+    } catch (error) {
+      console.error(`[call:${callSid.slice(-6)}] failed to hang up:`, error);
+    }
+  }, delayMs);
+}
+
+function updateGoalFromTool(callSid, args) {
+  const goalKey = getGoalByKey(args.goal) ? args.goal : null;
+  if (!goalKey) {
+    throw new Error(`Unknown goal: ${args.goal}`);
+  }
+
+  return saveState(callSid, (current) => {
+    const nextGoals = { ...(current.goals || createGoalState()) };
+    const now = new Date().toISOString();
+    const status = normalizeGoalStatus(args.status);
+    const answer = normalizeText(args.captured_answer || "");
+    const notes = normalizeText(args.notes || answer || "");
+    const currentGoalKey =
+      current.currentGoalKey ||
+      getNextOpenGoalKey(nextGoals) ||
+      goalKey ||
+      SCREENING_GOALS[0].key;
+    const nextAnswers = Array.isArray(current.answers)
+      ? [...current.answers]
+      : [];
+
+    nextGoals[goalKey] = {
+      status,
+      notes,
+      updatedAt: now,
+    };
+
+    if (answer) {
+      nextAnswers.push({
+        questionNumber: nextAnswers.length + 1,
+        goalKey,
+        goalLabel: getGoalByKey(goalKey)?.label || goalKey,
+        answer,
+        rawTranscript: current.lastUserMessage || "",
+        receivedAt: now,
+      });
+    }
+
+    const remainingGoalKey = getNextOpenGoalKey(nextGoals);
+    const completed = remainingGoalKey === null;
+    const nextGoalKey =
+      normalizeText(args.next_goal || "") && getGoalByKey(args.next_goal)
+        ? args.next_goal
+        : remainingGoalKey || currentGoalKey;
+
+    return {
+      ...current,
+      currentGoalKey: completed ? currentGoalKey : nextGoalKey,
+      goals: nextGoals,
+      answers: nextAnswers,
+      status: completed ? "completed" : "active",
+      endReason: completed ? null : current.endReason || null,
+      completedAt: completed ? now : current.completedAt || null,
+      emailStatus: completed ? "pending" : current.emailStatus || null,
+      lastError: null,
+      lastPrompt: JSON.stringify({ tool: "record_screening_update", args }),
+    };
+  });
+}
+
+function finishScreening(callSid, args) {
+  const now = new Date().toISOString();
+  const state = saveState(callSid, (current) => ({
+    ...current,
+    status: "completed",
+    summary: normalizeText(args.summary) || current.summary || "",
+    endReason: normalizeText(args.disposition) || "complete",
+    completedAt: now,
+    emailStatus: "pending",
+    lastError: null,
+    lastPrompt: JSON.stringify({ tool: "finish_screening", args }),
+  }));
+
+  void sendSummaryEmail(callSid);
+  return state;
+}
+
+function escalateToHuman(callSid, args) {
+  const now = new Date().toISOString();
+  const state = saveState(callSid, (current) => ({
+    ...current,
+    status: "failed",
+    summary: normalizeText(args.summary) || current.summary || "",
+    endReason: "escalated_to_human",
+    completedAt: now,
+    emailStatus: "pending",
+    lastError: normalizeText(args.reason) || "Escalated to human.",
+    lastPrompt: JSON.stringify({ tool: "escalate_to_human", args }),
+  }));
+
+  void sendSummaryEmail(callSid);
+  return state;
+}
+
+async function handleOpenAIToolCall(session, callId, name, argumentsText) {
+  if (callId && session.handledToolCallIds.has(callId)) {
+    logCall(session, `tool: skipping duplicate call_id=${callId} "${name}"`);
+    return;
+  }
+  if (callId) {
+    session.handledToolCallIds.add(callId);
+  }
+
+  const callSid = session.callSid;
+  const rawArgs = normalizeText(argumentsText || "{}");
+  let args;
+
+  try {
+    args = JSON.parse(rawArgs || "{}");
+  } catch {
+    args = {};
+  }
+
+  logCall(session, `tool: handling "${name}" args=${JSON.stringify(args)}`);
+
+  let state;
+  let output;
+
+  if (name === "record_screening_update") {
+    state = updateGoalFromTool(callSid, args);
+    logCall(session, `tool: record_screening_update goal=${args.goal} status=${args.status} -> screening=${state.status} nextGoal=${state.currentGoalKey}`);
+    if (state.status === "completed") {
+      logCall(session, `tool: all goals complete, pending hangup`);
+      session.pendingHangup = true;
+    }
+    output = {
+      ok: true,
+      callSid,
+      state: {
+        status: state.status,
+        currentGoalKey: state.currentGoalKey,
+        nextOpenGoalKey: getNextOpenGoalKey(state.goals),
+        goals: state.goals,
+      },
+    };
+  } else if (name === "finish_screening") {
+    state = finishScreening(callSid, args);
+    logCall(session, `tool: finish_screening disposition=${args.disposition}`);
+    session.pendingHangup = true;
+    output = {
+      ok: true,
+      callSid,
+      state: {
+        status: state.status,
+        summary: state.summary,
+        endReason: state.endReason,
+      },
+    };
+  } else if (name === "escalate_to_human") {
+    state = escalateToHuman(callSid, args);
+    logCall(session, `tool: escalate_to_human reason="${args.reason}"`);
+    session.pendingHangup = true;
+    output = {
+      ok: true,
+      callSid,
+      state: {
+        status: state.status,
+        summary: state.summary,
+        endReason: state.endReason,
+      },
+    };
+  } else {
+    logCall(session, `tool: unknown tool "${name}"`);
+    output = {
+      ok: false,
+      error: `Unknown tool call: ${name}`,
+    };
+  }
+
+  if (
+    session.openaiSocket &&
+    session.openaiSocket.readyState === WebSocket.OPEN
+  ) {
+    session.openaiSocket.send(
+      JSON.stringify({
+        type: "conversation.item.create",
+        item: {
+          type: "function_call_output",
+          call_id: callId,
+          output: JSON.stringify(output),
+        },
+      }),
+    );
+    if (!session.responseInProgress) {
+      logCall(session, `tool: sending response.create after tool result`);
+      session.openaiSocket.send(JSON.stringify({ type: "response.create" }));
+      session.responseInProgress = true;
+    } else {
+      logCall(session, `tool: skipping response.create — response already in progress`);
+    }
+  }
+}
+
+async function initializeOpenAISession(session) {
+  if (session.initialResponseSent) {
+    logCall(session, "openai: init skipped (already sent)");
+    return;
+  }
+
+  const state =
+    getState(session.callSid) ||
+    (await createInterviewSession(
+      session.callSid,
+      session.prospectName || "",
+      session.propertyName || "",
+    ));
+
+  logCall(session, `openai: sending session.update (goal=${state.currentGoalKey}, status=${state.status})`);
+  sendOpenAIJson(session, buildOpenAISessionUpdate(state));
+  session.initialResponseSent = true;
+}
+
+function handleOpenAIEvent(session, payload) {
+  const tag = callTag(session);
+
+  switch (payload.type) {
+    case "session.created":
+      logCall(session, `<< openai: session.created`);
+      break;
+    case "session.updated":
+      logCall(session, `<< openai: session.updated`);
+      break;
+    case "response.created":
+      logCall(session, `<< openai: response.created id=${payload.response?.id || "?"} (was inProgress=${session.responseInProgress})`);
+      session.responseInProgress = true;
+      session.lastResponseId =
+        payload.response?.id || payload.response_id || session.lastResponseId;
+      break;
+    case "input_audio_buffer.speech_started":
+      logCall(session, `<< openai: speech_started (assistantSpeaking=${session.assistantSpeaking}, responseInProgress=${session.responseInProgress})`);
+      // User started talking — cancel any pending debounced response
+      if (session.responseDebounceTimer) {
+        clearTimeout(session.responseDebounceTimer);
+        session.responseDebounceTimer = null;
+        logCall(session, "   cancelled pending response (user still talking)");
+      }
+      if (session.assistantSpeaking || session.responseInProgress) {
+        logCall(session, "   interrupting — sending response.cancel + clear");
+        sendOpenAIJson(session, { type: "response.cancel" });
+        sendTwilioJson(session, {
+          event: "clear",
+          streamSid: session.streamSid,
+        });
+        session.assistantSpeaking = false;
+      }
+      break;
+    case "input_audio_buffer.speech_stopped":
+      logCall(session, "<< openai: speech_stopped");
+      break;
+    case "input_audio_buffer.committed":
+      logCall(session, "<< openai: audio_buffer.committed");
+      // Don't respond immediately — debounce to let the user finish their thought.
+      // If they start speaking again within the delay, the timer is cancelled above.
+      if (session.responseDebounceTimer) {
+        clearTimeout(session.responseDebounceTimer);
+      }
+      session.responseDebounceTimer = setTimeout(() => {
+        session.responseDebounceTimer = null;
+        if (!session.closed && !session.responseInProgress) {
+          logCall(session, "   debounce fired — sending response.create");
+          sendOpenAIJson(session, { type: "response.create" });
+          session.responseInProgress = true;
+        }
+      }, openaiRealtimeResponseDelayMs);
+      break;
+    case "conversation.item.input_audio_transcription.completed": {
+      const transcript = (payload.transcript || "").trim();
+      logCall(session, `<< openai: user transcript: "${transcript}"`);
+      if (transcript.length <= 2) {
+        logCall(session, "   empty/noise transcript — cancelling response + clearing twilio buffer");
+        if (session.responseInProgress) {
+          sendOpenAIJson(session, { type: "response.cancel" });
+        }
+        // Clear audio already queued in Twilio so the user doesn't hear
+        // a partial "I didn't catch that" from the noise-triggered response
+        sendTwilioJson(session, { event: "clear", streamSid: session.streamSid });
+        session.assistantSpeaking = false;
+        break;
+      }
+      // If the transcript looks incomplete (filler words, trailing off)
+      // and we have a debounce timer pending, extend it to give the user
+      // more time to finish their thought.
+      if (looksIncomplete(transcript) && session.responseDebounceTimer) {
+        clearTimeout(session.responseDebounceTimer);
+        const extendedDelay = openaiRealtimeResponseDelayMs * 2;
+        logCall(session, `   incomplete transcript detected — extending debounce to ${extendedDelay}ms`);
+        session.responseDebounceTimer = setTimeout(() => {
+          session.responseDebounceTimer = null;
+          if (!session.closed && !session.responseInProgress) {
+            logCall(session, "   extended debounce fired — sending response.create");
+            sendOpenAIJson(session, { type: "response.create" });
+            session.responseInProgress = true;
+          }
+        }, extendedDelay);
+      }
+      saveState(session.callSid, (current) => ({
+        ...current,
+        lastUserMessage: transcript,
+      }));
+      break;
+    }
+    case "response.output_audio.delta":
+    case "response.audio.delta":
+      if (payload.delta) {
+        sendTwilioJson(session, {
+          event: "media",
+          streamSid: session.streamSid,
+          media: {
+            payload: payload.delta,
+          },
+        });
+        if (!session.assistantSpeaking) {
+          logCall(session, `<< openai: audio streaming started (response=${payload.response_id || "?"})`);
+        }
+        session.assistantSpeaking = true;
+      }
+      break;
+    case "response.output_audio_transcript.done":
+    case "response.audio_transcript.done":
+      if (payload.transcript) {
+        logCall(session, `<< openai: agent said: "${payload.transcript}"`);
+        saveState(session.callSid, (current) => ({
+          ...current,
+          lastAgentMessage: payload.transcript,
+          lastPrompt: JSON.stringify({
+            response_id: payload.response_id || null,
+            transcript: payload.transcript,
+          }),
+        }));
+      }
+      break;
+    case "response.output_audio.done":
+    case "response.audio.done":
+      logCall(session, `<< openai: audio done (pendingHangup=${session.pendingHangup})`);
+      if (session.pendingHangup) {
+        const markName = `final-${payload.response_id || Date.now()}`;
+        session.pendingMarkName = markName;
+        sendTwilioJson(session, {
+          event: "mark",
+          streamSid: session.streamSid,
+          mark: {
+            name: markName,
+          },
+        });
+      }
+      session.assistantSpeaking = false;
+      break;
+    case "response.function_call_arguments.done":
+      logCall(session, `<< openai: tool call "${payload.name}" (call_id=${payload.call_id || "?"})`);
+      void handleOpenAIToolCall(
+        session,
+        payload.call_id,
+        payload.name,
+        payload.arguments,
+      );
+      break;
+    case "response.output_item.done":
+      if (payload.item?.type === "function_call") {
+        logCall(session, `<< openai: tool call (output_item) "${payload.item.name}" (call_id=${payload.item.call_id || payload.item.id || "?"})`);
+        void handleOpenAIToolCall(
+          session,
+          payload.item.call_id || payload.item.id,
+          payload.item.name,
+          payload.item.arguments || payload.item.arguments_json || "{}",
+        );
+      }
+      break;
+    case "response.done": {
+      const outputs = payload.response?.output || [];
+      const outputTypes = outputs.map((o) => o.type).join(", ") || "none";
+      logCall(session, `<< openai: response.done id=${payload.response?.id || "?"} outputs=[${outputTypes}]`);
+      session.assistantSpeaking = false;
+      session.responseInProgress = false;
+      session.lastResponseId = null;
+
+      // After a tool-call-only response, OpenAI won't auto-generate a
+      // follow-up. We need to explicitly request one so the agent speaks
+      // the next question instead of sitting in silence.
+      const hasOnlyToolCalls =
+        outputs.length > 0 && outputs.every((o) => o.type === "function_call");
+      if (hasOnlyToolCalls && !session.closed) {
+        logCall(session, `   tool-call-only response — sending response.create for follow-up`);
+        sendOpenAIJson(session, { type: "response.create" });
+        session.responseInProgress = true;
+      }
+      break;
+    }
+    case "error":
+      if (payload.error?.code === "response_cancel_not_active") {
+        logCall(session, `<< openai: cancel-not-active (harmless race, resetting state)`);
+        session.assistantSpeaking = false;
+        session.responseInProgress = false;
+        return;
+      }
+      logCall(session, `<< openai: ERROR ${JSON.stringify(payload.error)}`);
+      console.error(`${tag} << openai: ERROR`, payload.error);
+      session.responseInProgress = false;
+      session.lastResponseId = null;
+      saveState(session.callSid, (current) => ({
+        ...current,
+        status: "failed",
+        lastError:
+          payload.error?.message ||
+          payload.error?.toString?.() ||
+          "OpenAI realtime error",
+      }));
+      scheduleHangup(session.callSid, 1200);
+      break;
+    default:
+      break;
   }
 }
 
 async function anthropicJson(apiPath, body) {
   const response = await fetch(`https://api.anthropic.com/v1${apiPath}`, {
-    method: body ? 'POST' : 'GET',
+    method: body ? "POST" : "GET",
     headers: {
-      'x-api-key': anthropicApiKey,
-      'anthropic-version': '2023-06-01',
-      'anthropic-beta': 'managed-agents-2026-04-01',
-      'content-type': 'application/json',
-      accept: 'application/json',
+      "x-api-key": anthropicApiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "managed-agents-2026-04-01",
+      "content-type": "application/json",
+      accept: "application/json",
     },
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -927,33 +1918,31 @@ async function anthropicJson(apiPath, body) {
 }
 
 async function createInterviewSession(callSid, prospectName, propertyName) {
-  const session = await anthropicJson('/sessions', {
-    agent: agentId,
-    environment_id: environmentId,
-    title: `Tenant screening ${callSid}`,
-    metadata: {
-      call_sid: callSid,
-      prospect_name: prospectName || '',
-      property_name: propertyName || '',
-    },
-  });
-
   const now = new Date().toISOString();
   const state = {
     callSid,
-    sessionId: session.id,
     prospectName: normalizeText(prospectName),
     propertyName: normalizeText(propertyName),
     turn: 0,
+    currentGoalKey: SCREENING_GOALS[0].key,
+    goals: createGoalState(),
+    unclearAttempts: 0,
     answers: [],
-    summary: '',
-    status: 'active',
+    summary: "",
+    status: "active",
+    endReason: null,
     createdAt: now,
     updatedAt: now,
-    lastPrompt: '',
-    lastAgentMessage: '',
-    lastUserMessage: '',
+    lastPrompt: "",
+    lastAgentMessage: "",
+    lastUserMessage: "",
     lastError: null,
+    openaiSessionId: null,
+    streamSid: null,
+    assistantSpeaking: false,
+    pendingHangup: false,
+    pendingResponseId: null,
+    pendingMarkName: null,
   };
 
   callState.set(callSid, state);
@@ -962,54 +1951,83 @@ async function createInterviewSession(callSid, prospectName, propertyName) {
 }
 
 function buildTurnPrompt(state, callerText) {
-  const promptLines = [
-    'You are conducting a live tenant screening phone interview.',
-    'Return plain text only. No markdown, no bullets, and no preamble.',
-    'Speak naturally and keep each question short.',
-    'Ask exactly one question at a time.',
-    'Do not ask about protected characteristics.',
-    'If the caller answer seems unclear, incomplete, or noisy, ask them to repeat it once before moving on.',
-    `Prospect name: ${state.prospectName || 'unknown'}.`,
-    `Property: ${state.propertyName || 'unknown'}.`,
-  ];
+  const currentGoalKey =
+    state.currentGoalKey ||
+    getNextOpenGoalKey(state.goals) ||
+    SCREENING_GOALS[0].key;
+  const currentGoal = getGoalByKey(currentGoalKey) || SCREENING_GOALS[0];
+  const goalStateSummary = SCREENING_GOALS.map((goal) => ({
+    goal: goal.key,
+    label: goal.label,
+    status: state.goals?.[goal.key]?.status || "open",
+    notes: state.goals?.[goal.key]?.notes || "",
+  }));
 
-  if (state.turn === 0) {
-    promptLines.push('Ask the first screening question now about employment and income verification.');
-  } else if (state.turn === 1) {
-    promptLines.push(`The caller answered the first question: ${callerText || 'no answer captured'}.`);
-    promptLines.push('Ask the second screening question now about move-in timeline and desired lease term.');
-  } else if (state.turn === 2) {
-    promptLines.push(`The caller answered the second question: ${callerText || 'no answer captured'}.`);
-    promptLines.push('Ask the third screening question now about rental history and references.');
-  } else {
-    promptLines.push('The caller has answered all three screening questions.');
-    promptLines.push(`Collected answers: ${JSON.stringify(state.answers, null, 2)}.`);
-    promptLines.push('Provide a concise reviewer summary for the human reviewer only. Do not include a farewell and do not speak as if addressing the caller.');
-  }
+  const payload = {
+    prospectName: state.prospectName || "unknown",
+    propertyName: state.propertyName || "unknown",
+    currentGoal: {
+      key: currentGoal.key,
+      label: currentGoal.label,
+      guidance: currentGoal.guidance,
+    },
+    completedGoals: goalStateSummary.filter(
+      (goal) => goal.status === "complete",
+    ),
+    goalState: goalStateSummary,
+    latestCallerTranscript: callerText || null,
+    lastQuestionAsked: state.lastAgentMessage || null,
+    priorCapturedAnswers: state.answers || [],
+  };
 
-  return promptLines.join(' ');
+  return [
+    "You are conducting a live tenant screening phone interview.",
+    "The speech transcript may be imperfect because it comes from a phone call.",
+    "Your job is to decide whether the latest caller transcript sufficiently answers the current goal, whether to ask a clarifying follow-up, or whether to move to the next goal.",
+    "Be conversational and warm, not robotic.",
+    "Ask exactly one question at a time.",
+    "Keep spoken questions short and natural for phone audio.",
+    "Do not ask about protected characteristics.",
+    "If the transcript is partial but useful, capture what you can and ask a focused follow-up.",
+    "Return only valid JSON with this exact shape:",
+    '{"next_action":"ask_followup|ask_next_goal|complete_screening","spoken_response":"string","captured_answer":"string","goal_updates":[{"goal":"employment_income|move_in_timeline|rental_history_references","status":"open|partial|complete","notes":"string"}],"reviewer_summary":"string"}',
+    "Set reviewer_summary only when all goals are complete. Otherwise return an empty string for reviewer_summary.",
+    `Current call state: ${JSON.stringify(payload)}`,
+  ].join("\n");
+}
+
+function extractTextFromAgentMessage(messageEvent) {
+  const content = messageEvent?.content || [];
+  return content
+    .map((block) => (block && block.type === "text" ? block.text : ""))
+    .filter(Boolean)
+    .join("\n")
+    .trim();
 }
 
 async function sendSessionMessage(sessionId, text) {
   await anthropicJson(`/sessions/${sessionId}/events`, {
     events: [
       {
-        type: 'user.message',
-        content: [{ type: 'text', text }],
+        type: "user.message",
+        content: [{ type: "text", text }],
       },
     ],
   });
 }
 
 async function listSessionEvents(sessionId) {
-  const response = await fetch(`https://api.anthropic.com/v1/sessions/${sessionId}/events?beta=true`, {
-    headers: {
-      'x-api-key': anthropicApiKey,
-      'anthropic-version': '2023-06-01',
-      'anthropic-beta': 'managed-agents-2026-04-01',
-      accept: 'application/json',
+  const response = await fetch(
+    `https://api.anthropic.com/v1/sessions/${sessionId}/events?beta=true`,
+    {
+      headers: {
+        "x-api-key": anthropicApiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "managed-agents-2026-04-01",
+        accept: "application/json",
+      },
     },
-  });
+  );
 
   if (!response.ok) {
     const text = await response.text();
@@ -1021,45 +2039,136 @@ async function listSessionEvents(sessionId) {
 }
 
 async function waitForAgentReply(sessionId, previousCount) {
-  const deadline = Date.now() + 15000;
+  const deadline = Date.now() + agentReplyTimeoutMs;
   while (Date.now() < deadline) {
     const events = await listSessionEvents(sessionId);
-    const agentMessages = events.filter((event) => event.type === 'agent.message');
+    const agentMessages = events.filter(
+      (event) => event.type === "agent.message",
+    );
     if (agentMessages.length > previousCount) {
-      return agentMessages[agentMessages.length - 1];
+      return {
+        message: agentMessages[agentMessages.length - 1],
+        count: agentMessages.length,
+      };
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise((resolve) =>
+      setTimeout(resolve, agentReplyPollIntervalMs),
+    );
   }
-  throw new Error('Timed out waiting for agent reply');
+  throw new Error("Timed out waiting for agent reply");
 }
 
-function extractTextFromAgentMessage(messageEvent) {
-  const content = messageEvent?.content || [];
-  return content
-    .map((block) => (block && block.type === 'text' ? block.text : ''))
-    .filter(Boolean)
-    .join('\n')
-    .trim();
+function connectOpenAIRealtime(session) {
+  if (
+    session.openaiSocket &&
+    session.openaiSocket.readyState === WebSocket.OPEN
+  ) {
+    return session.openaiSocket;
+  }
+
+  const realtimeUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(openaiRealtimeModel)}`;
+  const socket = new WebSocket(realtimeUrl, {
+    headers: {
+      Authorization: `Bearer ${openaiApiKey}`,
+    },
+  });
+
+  session.openaiSocket = socket;
+
+  socket.on("open", () => {
+    logCall(session, `openai: websocket connected`);
+    session.openaiReady = true;
+    initializeOpenAISession(session).catch((error) => {
+      console.error(
+        `${callTag(session)} openai: failed to initialize session:`,
+        error,
+      );
+      saveState(session.callSid, (current) => ({
+        ...current,
+        status: "failed",
+        lastError: error.message,
+      }));
+      scheduleHangup(session.callSid, 1200);
+    });
+    flushPendingTwilioAudio(session);
+  });
+
+  socket.on("message", (raw) => {
+    try {
+      const payload = JSON.parse(raw.toString());
+      handleOpenAIEvent(session, payload);
+    } catch (error) {
+      console.error(
+        `${callTag(session)} openai: failed to parse message:`,
+        error,
+      );
+    }
+  });
+
+  socket.on("error", (error) => {
+    console.error(`${callTag(session)} openai: socket error:`, error);
+    saveState(session.callSid, (current) => ({
+      ...current,
+      status: "failed",
+      lastError: error.message,
+    }));
+    scheduleHangup(session.callSid, 1200);
+  });
+
+  socket.on("close", () => {
+    logCall(session, `openai: websocket closed`);
+    session.openaiReady = false;
+    if (!session.closed) {
+      scheduleHangup(session.callSid, 1200);
+    }
+  });
+
+  return socket;
 }
 
 function validateTwilioRequest(req) {
-  if (process.env.VALIDATE_TWILIO_WEBHOOKS !== 'true') {
+  if (process.env.VALIDATE_TWILIO_WEBHOOKS !== "true") {
     return true;
   }
 
-  const signature = req.get('X-Twilio-Signature') || '';
-  const externalBaseUrl = appBaseUrl || `${req.protocol}://${req.get('host')}`;
+  const signature = req.get("X-Twilio-Signature") || "";
+  const externalBaseUrl = appBaseUrl || `${req.protocol}://${req.get("host")}`;
   const url = `${externalBaseUrl}${req.originalUrl}`;
   return twilio.validateRequest(twilioAuthToken, signature, url, req.body);
 }
 
+function extractTwilioParameters(message) {
+  const start = message?.start || {};
+  const custom = start.customParameters || {};
+  const callSid =
+    normalizeText(message?.callSid) ||
+    normalizeText(start.callSid) ||
+    normalizeText(custom.callSid) ||
+    normalizeText(custom.CallSid) ||
+    "";
+
+  return {
+    callSid,
+    prospectName:
+      normalizeText(custom.prospectName) ||
+      normalizeText(custom.prospect_name) ||
+      normalizeText(start.prospectName) ||
+      "",
+    propertyName:
+      normalizeText(custom.propertyName) ||
+      normalizeText(custom.property_name) ||
+      normalizeText(start.propertyName) ||
+      "",
+  };
+}
+
 function parseRequestText(req) {
-  return normalizeText(req.body.SpeechResult || req.body.Digits || '');
+  return normalizeText(req.body.SpeechResult || req.body.Digits || "");
 }
 
 function parseSpeechConfidence(req) {
   const value = req.body?.Confidence ?? req.body?.confidence;
-  if (value == null || value === '') {
+  if (value == null || value === "") {
     return null;
   }
 
@@ -1067,14 +2176,185 @@ function parseSpeechConfidence(req) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function getProspectAndProperty(req) {
+function looksLikeNonAnswer(text) {
+  const normalized = normalizeText(text).toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+
+  const exactPhrases = new Set([
+    "hello",
+    "hi",
+    "hey",
+    "what",
+    "pardon",
+    "sorry",
+    "repeat that",
+    "say that again",
+  ]);
+
+  if (exactPhrases.has(normalized)) {
+    return true;
+  }
+
+  const patterns = [
+    /\b(can you|could you|would you)\s+(repeat|say that again)\b/,
+    /\b(i|you)\s+(didn't|did not|cant|can't)\s+(hear|catch)\b/,
+    /\b(cut out|breaking up|hard to hear|say that again)\b/,
+    /\bwhat was the question\b/,
+    /\brepeat (the )?question\b/,
+    /\bstart over\b/,
+  ];
+
+  return patterns.some((pattern) => pattern.test(normalized));
+}
+
+function registerUnclearAttempt(callSid) {
+  return saveState(callSid, (current) => {
+    const unclearAttempts = (current.unclearAttempts || 0) + 1;
+    const exhausted = unclearAttempts >= maxUnclearAttempts;
+    return {
+      ...current,
+      unclearAttempts,
+      status: exhausted ? "terminated" : current.status,
+      endReason: exhausted
+        ? "too_many_unclear_responses"
+        : current.endReason || null,
+      completedAt: exhausted
+        ? new Date().toISOString()
+        : current.completedAt || null,
+      lastError: exhausted
+        ? "Too many unclear responses."
+        : current.lastError || null,
+    };
+  });
+}
+
+function createGoalState() {
+  return Object.fromEntries(
+    SCREENING_GOALS.map((goal) => [
+      goal.key,
+      { status: "open", notes: "", updatedAt: null },
+    ]),
+  );
+}
+
+function getGoalByKey(goalKey) {
+  return SCREENING_GOALS.find((goal) => goal.key === goalKey) || null;
+}
+
+function getNextOpenGoalKey(goals) {
+  for (const goal of SCREENING_GOALS) {
+    if ((goals?.[goal.key]?.status || "open") !== "complete") {
+      return goal.key;
+    }
+  }
+  return null;
+}
+
+function normalizeGoalStatus(value) {
+  return value === "complete" || value === "partial" ? value : "open";
+}
+
+function extractJsonObject(text) {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+function parseAgentTurnResponse(rawText, state) {
+  const fallbackGoalKey =
+    state.currentGoalKey ||
+    getNextOpenGoalKey(state.goals) ||
+    SCREENING_GOALS[0].key;
+  const parsed = extractJsonObject(rawText);
+
+  if (!parsed || typeof parsed !== "object") {
+    return {
+      nextAction: "ask_followup",
+      spokenResponse:
+        normalizeText(rawText) || "Could you tell me a little more about that?",
+      capturedAnswer: "",
+      reviewerSummary: "",
+      goalUpdates: [],
+    };
+  }
+
+  const nextAction =
+    parsed.next_action === "ask_next_goal" ||
+    parsed.next_action === "complete_screening" ||
+    parsed.next_action === "ask_followup"
+      ? parsed.next_action
+      : "ask_followup";
+
+  const spokenResponse = normalizeText(parsed.spoken_response || "");
+  const capturedAnswer = normalizeText(parsed.captured_answer || "");
+  const reviewerSummary = normalizeText(parsed.reviewer_summary || "");
+  const goalUpdates = Array.isArray(parsed.goal_updates)
+    ? parsed.goal_updates
+        .map((update) => {
+          const goalKey = normalizeText(update?.goal || "");
+          if (!getGoalByKey(goalKey)) {
+            return null;
+          }
+          return {
+            goal: goalKey,
+            status: normalizeGoalStatus(update?.status),
+            notes: normalizeText(update?.notes || ""),
+          };
+        })
+        .filter(Boolean)
+    : [];
+
+  if (
+    capturedAnswer &&
+    !goalUpdates.some((update) => update.goal === fallbackGoalKey)
+  ) {
+    goalUpdates.push({
+      goal: fallbackGoalKey,
+      status: nextAction === "ask_followup" ? "partial" : "complete",
+      notes: capturedAnswer,
+    });
+  }
+
   return {
-    prospectName: normalizeText(req.query.prospectName || req.body.prospectName || ''),
-    propertyName: normalizeText(req.query.propertyName || req.body.propertyName || ''),
+    nextAction,
+    spokenResponse:
+      spokenResponse ||
+      (nextAction === "complete_screening"
+        ? "Thank you. That gives us what we need."
+        : "Could you tell me a little more about that?"),
+    capturedAnswer,
+    reviewerSummary,
+    goalUpdates,
   };
 }
 
-async function advanceInterview(callSid, callerText, prospectName, propertyName) {
+function getProspectAndProperty(req) {
+  return {
+    prospectName: normalizeText(
+      req.query.prospectName || req.body.prospectName || "",
+    ),
+    propertyName: normalizeText(
+      req.query.propertyName || req.body.propertyName || "",
+    ),
+  };
+}
+
+async function advanceInterview(
+  callSid,
+  callerText,
+  prospectName,
+  propertyName,
+) {
   let state = getState(callSid);
   if (!state) {
     state = await createInterviewSession(callSid, prospectName, propertyName);
@@ -1082,74 +2362,106 @@ async function advanceInterview(callSid, callerText, prospectName, propertyName)
 
   const userText = normalizeText(callerText);
 
-  if (userText) {
-    state = saveState(callSid, (current) => {
-      const nextAnswers = Array.isArray(current.answers) ? [...current.answers] : [];
-      if (current.turn >= 1 && current.turn <= 3) {
-        nextAnswers.push({
-          questionNumber: current.turn,
-          answer: userText,
-          receivedAt: new Date().toISOString(),
-        });
-      }
-
-      return {
-        ...current,
-        lastUserMessage: userText,
-        answers: nextAnswers,
-      };
-    });
-  }
-
-  if (state.status === 'completed') {
-    return state.lastAgentMessage || state.summary || 'Thank you. Goodbye.';
+  if (isTerminalState(state)) {
+    return state.lastAgentMessage || state.summary || "Thank you. Goodbye.";
   }
 
   const prompt = buildTurnPrompt(state, userText);
-  const priorAgentMessages = (await listSessionEvents(state.sessionId)).filter((event) => event.type === 'agent.message').length;
+  const priorAgentMessages = state.agentMessageCount || 0;
   await sendSessionMessage(state.sessionId, prompt);
   const reply = await waitForAgentReply(state.sessionId, priorAgentMessages);
-  const replyText = extractTextFromAgentMessage(reply) || 'Thank you. Goodbye.';
+  const replyText =
+    extractTextFromAgentMessage(reply.message) || "Thank you. Goodbye.";
+  const agentTurn = parseAgentTurnResponse(replyText, state);
 
   const nextState = saveState(callSid, (current) => {
-    const nextTurn = (current.turn || 0) + 1;
-    const completed = nextTurn >= 4;
+    const currentGoalKey =
+      current.currentGoalKey ||
+      getNextOpenGoalKey(current.goals) ||
+      SCREENING_GOALS[0].key;
+    const nextGoals = { ...(current.goals || createGoalState()) };
+
+    for (const update of agentTurn.goalUpdates) {
+      nextGoals[update.goal] = {
+        status: update.status,
+        notes: update.notes || nextGoals[update.goal]?.notes || "",
+        updatedAt: new Date().toISOString(),
+      };
+    }
+
+    const remainingGoalKey = getNextOpenGoalKey(nextGoals);
+    const completed =
+      agentTurn.nextAction === "complete_screening" ||
+      remainingGoalKey === null;
+    const nextCurrentGoalKey = completed
+      ? currentGoalKey
+      : remainingGoalKey || currentGoalKey;
+    const nextAnswers = Array.isArray(current.answers)
+      ? [...current.answers]
+      : [];
+
+    if (userText && agentTurn.capturedAnswer) {
+      nextAnswers.push({
+        questionNumber: nextAnswers.length + 1,
+        goalKey: currentGoalKey,
+        goalLabel: getGoalByKey(currentGoalKey)?.label || currentGoalKey,
+        answer: agentTurn.capturedAnswer,
+        rawTranscript: userText,
+        receivedAt: new Date().toISOString(),
+      });
+    }
+
     return {
       ...current,
-      turn: nextTurn,
+      turn: (current.turn || 0) + 1,
+      currentGoalKey: nextCurrentGoalKey,
+      goals: nextGoals,
+      answers: nextAnswers,
+      agentMessageCount: reply.count,
+      lastUserMessage: userText || current.lastUserMessage || "",
+      unclearAttempts: userText ? 0 : current.unclearAttempts || 0,
       lastPrompt: prompt,
-      lastAgentMessage: replyText,
-      summary: completed ? replyText : current.summary || '',
-      status: completed ? 'completed' : 'active',
-      completedAt: completed ? new Date().toISOString() : current.completedAt || null,
-      emailStatus: completed ? 'pending' : current.emailStatus || null,
+      lastAgentMessage: agentTurn.spokenResponse,
+      summary: completed
+        ? agentTurn.reviewerSummary || current.summary || ""
+        : current.summary || "",
+      status: completed ? "completed" : "active",
+      endReason: completed ? null : current.endReason || null,
+      completedAt: completed
+        ? new Date().toISOString()
+        : current.completedAt || null,
+      emailStatus: completed ? "pending" : current.emailStatus || null,
       lastError: null,
     };
   });
 
-  if (nextState.status === 'completed') {
+  if (nextState.status === "completed") {
     void sendSummaryEmail(callSid);
   }
 
-  return nextState.lastAgentMessage || replyText;
+  return nextState.lastAgentMessage || agentTurn.spokenResponse || replyText;
 }
 
-app.get('/health', (_req, res) => {
+app.get("/health", (_req, res) => {
   const runtime = loadRuntimeConfig();
   res.json({
     ok: true,
-    voice: selectedVoice,
+    provider: "openai-realtime",
+    model: openaiRealtimeModel,
+    voice: openaiRealtimeVoice,
+    idleTimeoutMs: openaiRealtimeIdleTimeoutMs,
     fallbackVoice,
+    defaultFromNumber,
     publicBaseUrl: runtime?.appBaseUrl || runtime?.publicBaseUrl || null,
     statePath,
   });
 });
 
-app.get('/testing', (_req, res) => {
-  res.type('html').send(renderTestingPage());
+app.get("/testing", (_req, res) => {
+  res.type("html").send(renderTestingPage());
 });
 
-app.post('/testing/start', async (req, res) => {
+app.post("/testing/start", async (req, res) => {
   try {
     const callParams = buildOutboundCallParams(req.body || {});
     const call = await twilioClient.calls.create(callParams);
@@ -1168,125 +2480,204 @@ app.post('/testing/start', async (req, res) => {
 
     res.status(201).json(structuredContent);
   } catch (error) {
-    console.error('Failed to start testing call:', error);
-    res.status(400).json({ error: error.message || 'Failed to start the call.' });
+    console.error("Failed to start testing call:", error);
+    res
+      .status(400)
+      .json({ error: error.message || "Failed to start the call." });
   }
 });
 
-app.post('/voice/start', async (req, res) => {
+app.post("/voice/start", async (req, res) => {
   if (!validateTwilioRequest(req)) {
-    res.status(403).type('text/plain').send('Forbidden');
+    res.status(403).type("text/plain").send("Forbidden");
     return;
   }
 
   try {
     const callSid = req.body.CallSid;
     if (!callSid) {
-      res.status(400).type('text/plain').send('Missing CallSid');
+      res.status(400).type("text/plain").send("Missing CallSid");
       return;
     }
 
     const { prospectName, propertyName } = getProspectAndProperty(req);
     let state = getState(callSid);
-
     if (!state) {
       state = await createInterviewSession(callSid, prospectName, propertyName);
     }
 
-    if (state.status === 'completed') {
-      void sendSummaryEmail(callSid);
-      res.type('text/xml').send(buildSayAndHangupTwiML(buildClosingMessage(state)));
+    if (isTerminalState(state)) {
+      if (state.status === "completed") {
+        void sendSummaryEmail(callSid);
+      }
+      res
+        .type("text/xml")
+        .send(buildSayAndHangupTwiML(buildClosingMessage(state)));
       return;
     }
 
-    if (state.lastAgentMessage && state.turn > 0) {
-      res.type('text/xml').send(buildGatherTwiML(state.lastAgentMessage, '/voice/turn'));
-      return;
-    }
-
-    const prompt = await advanceInterview(callSid, '', state.prospectName, state.propertyName);
-    res.type('text/xml').send(buildGatherTwiML(prompt, '/voice/turn'));
+    res
+      .type("text/xml")
+      .send(
+        buildConnectStreamTwiML(
+          callSid,
+          state.prospectName || prospectName,
+          state.propertyName || propertyName,
+        ),
+      );
   } catch (error) {
     console.error(error);
     saveState(req.body.CallSid || `error-${Date.now()}`, (current) => ({
       ...current,
-      status: 'failed',
+      status: "failed",
       lastError: error.message,
     }));
-    res.type('text/xml').send(buildSayAndHangupTwiML('Sorry, I had trouble starting the screening call.'));
+    res
+      .type("text/xml")
+      .send(
+        buildSayAndHangupTwiML(
+          "Sorry, I had trouble starting the screening call.",
+        ),
+      );
   }
 });
 
-app.post('/voice/turn', async (req, res) => {
-  if (!validateTwilioRequest(req)) {
-    res.status(403).type('text/plain').send('Forbidden');
-    return;
-  }
-
-  try {
-    const callSid = req.body.CallSid;
-    if (!callSid) {
-      res.status(400).type('text/plain').send('Missing CallSid');
-      return;
-    }
-
-    const callerText = parseRequestText(req);
-    const confidence = parseSpeechConfidence(req);
-    const { prospectName, propertyName } = getProspectAndProperty(req);
-    let state = getState(callSid);
-
-    if (!state) {
-      state = await createInterviewSession(callSid, prospectName, propertyName);
-    }
-
-    if (state.status === 'completed') {
-      void sendSummaryEmail(callSid);
-      res.type('text/xml').send(buildSayAndHangupTwiML(buildClosingMessage(state)));
-      return;
-    }
-
-    if (!callerText) {
-      const reprompt = state.lastAgentMessage || 'Sorry, I did not catch that. Please answer again.';
-      res.type('text/xml').send(buildGatherTwiML(reprompt, '/voice/turn'));
-      return;
-    }
-
-    if (confidence !== null && confidence < lowConfidenceThreshold) {
-      const reprompt =
-        state.lastAgentMessage ||
-        'Sorry, that was hard to hear. Please repeat your answer slowly and clearly.';
-      res.type('text/xml').send(buildGatherTwiML(reprompt, '/voice/turn'));
-      return;
-    }
-
-    const prompt = await advanceInterview(callSid, callerText, state.prospectName, state.propertyName);
-    const latestState = getState(callSid);
-
-    if (latestState?.status === 'completed') {
-      res.type('text/xml').send(buildSayAndHangupTwiML(buildClosingMessage(latestState)));
-      return;
-    }
-
-    res.type('text/xml').send(buildGatherTwiML(prompt, '/voice/turn'));
-  } catch (error) {
-    console.error(error);
-    if (req.body?.CallSid) {
-      saveState(req.body.CallSid, (current) => ({
-        ...current,
-        status: 'failed',
-        lastError: error.message,
-      }));
-    }
-    res.type('text/xml').send(buildSayAndHangupTwiML('Sorry, I had trouble processing that answer.'));
-  }
+app.post("/voice/turn", (_req, res) => {
+  res
+    .status(410)
+    .type("text/plain")
+    .send("This voice bridge now uses Twilio Media Streams at /voice/stream.");
 });
 
-app.get('/voice/state/:callSid', (req, res) => {
+app.get("/voice/state/:callSid", (req, res) => {
   res.json(getState(req.params.callSid));
 });
 
+const streamWss = new WebSocketServer({ server, path: "/voice/stream" });
+
+streamWss.on("connection", (ws) => {
+  let session = null;
+
+  ws.on("message", async (raw) => {
+    let message;
+    try {
+      message = JSON.parse(raw.toString());
+    } catch (error) {
+      console.error("Invalid Twilio websocket payload:", error);
+      return;
+    }
+
+    if (message.event === "connected") {
+      console.log("[twilio] stream connected");
+      return;
+    }
+
+    if (message.event === "start") {
+      const params = extractTwilioParameters(message);
+      const callSid = params.callSid;
+      if (!callSid) {
+        console.error("[twilio] stream start missing callSid");
+        return;
+      }
+
+      // logCall not available yet — session created below
+      console.log(
+        `[call:${callSid.slice(-6)}] << twilio: stream start prospect="${params.prospectName}" property="${params.propertyName}"`,
+      );
+
+      let state = getState(callSid);
+      if (!state) {
+        state = await createInterviewSession(
+          callSid,
+          params.prospectName,
+          params.propertyName,
+        );
+      }
+
+      state = saveState(callSid, (current) => ({
+        ...current,
+        prospectName: current.prospectName || params.prospectName || "",
+        propertyName: current.propertyName || params.propertyName || "",
+        streamSid:
+          message.streamSid ||
+          message.start?.streamSid ||
+          current.streamSid ||
+          null,
+        lastError: null,
+      }));
+
+      session = getRealtimeSession(callSid);
+      session.twilioSocket = ws;
+      session.streamSid = message.streamSid || message.start?.streamSid || null;
+      session.prospectName = state.prospectName;
+      session.propertyName = state.propertyName;
+
+      logCall(session, `<< twilio: stream start prospect="${params.prospectName}" property="${params.propertyName}"`);
+      logCall(session, "connecting to OpenAI realtime...");
+      connectOpenAIRealtime(session);
+      return;
+    }
+
+    if (!session) {
+      return;
+    }
+
+    if (message.event === "media") {
+      const payload = message.media?.payload;
+      if (!payload) {
+        return;
+      }
+
+      if (
+        session.openaiSocket &&
+        session.openaiSocket.readyState === WebSocket.OPEN
+      ) {
+        sendOpenAIJson(session, {
+          type: "input_audio_buffer.append",
+          audio: payload,
+        });
+      } else {
+        session.pendingTwilioAudio.push(payload);
+      }
+      return;
+    }
+
+    if (message.event === "mark") {
+      logCall(session, `<< twilio: mark received (pendingHangup=${session.pendingHangup})`);
+      if (session.pendingHangup) {
+        scheduleHangup(session.callSid, 250);
+      }
+      return;
+    }
+
+    if (message.event === "stop") {
+      logCall(session, `<< twilio: stream stop`);
+      closeRealtimeSession(session.callSid, "twilio_stop");
+    }
+  });
+
+  ws.on("close", () => {
+    if (session) {
+      closeRealtimeSession(session.callSid, "twilio_close");
+    }
+  });
+
+  ws.on("error", (error) => {
+    console.error("Twilio websocket error:", error);
+    if (session) {
+      saveState(session.callSid, (current) => ({
+        ...current,
+        status: "failed",
+        lastError: error.message,
+      }));
+    }
+  });
+});
+
 const port = Number(process.env.VOICE_PORT || 8002);
-app.listen(port, () => {
+server.listen(port, () => {
   console.log(`Voice bridge listening on port ${port}`);
-  console.log(`Voice prompts use ${selectedVoice} (${selectedLanguage})`);
+  console.log(
+    `Realtime model: ${openaiRealtimeModel} using ${openaiRealtimeVoice}`,
+  );
 });
