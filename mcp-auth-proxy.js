@@ -29,6 +29,12 @@ function route(req, res) {
     return;
   }
 
+  if (url.startsWith('/dashboard')) {
+    console.log(`[dashboard] ${req.method} ${req.url}`);
+    proxy.web(req, res, { target: `http://localhost:${VOICE_PORT}` });
+    return;
+  }
+
   if (url.startsWith('/formspree')) {
     console.log(`[formspree] ${req.method} ${req.url}`);
     proxy.web(req, res, { target: `http://localhost:${VOICE_PORT}` });
