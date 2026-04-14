@@ -7,6 +7,12 @@ const path = require("path");
 const nodemailer = require("nodemailer");
 const { WebSocketServer, WebSocket } = require("ws");
 const twilio = require("twilio");
+const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
+const {
+  StreamableHTTPServerTransport,
+} = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
+const { z } = require("zod/v4");
+const { mountMcpOAuth } = require("./mcp-oauth.js");
 
 function requiredEnv(name) {
   const value = process.env[name];
@@ -1612,7 +1618,7 @@ function renderDashboardPage() {
     }
 
     .panel-header {
-      padding: 16px 0 12px;
+      padding: 16px 18px 12px;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -1637,7 +1643,7 @@ function renderDashboardPage() {
 
     .list {
       display: grid;
-      margin-top: 14px;
+      margin: 14px 18px 0;
       border: 1px solid var(--border);
       border-radius: 16px;
       overflow: hidden;
@@ -1734,7 +1740,7 @@ function renderDashboardPage() {
     }
 
     .detail {
-      padding: 16px 0 18px;
+      padding: 16px 18px 18px;
       display: grid;
       gap: 14px;
     }
@@ -1932,7 +1938,7 @@ function renderDashboardPage() {
     }
 
     .empty {
-      padding: 18px 0;
+      padding: 18px 16px;
       color: var(--muted);
       line-height: 1.6;
     }
@@ -2030,7 +2036,6 @@ function renderDashboardPage() {
               </div>
               <button type="submit" id="dashboard-test-button">Start test</button>
             </form>
-            <button id="refresh">Refresh</button>
           </div>
           <div class="test-inline-result" id="dashboard-test-result" aria-live="polite">No test call has been started yet.</div>
         </div>
@@ -2080,7 +2085,6 @@ function renderDashboardPage() {
     const detailEl = document.getElementById('detail');
     const selectedIdEl = document.getElementById('selected-id');
     const statsEl = document.getElementById('stats');
-    const refreshBtn = document.getElementById('refresh');
     const themeToggleButton = document.getElementById('theme-toggle');
     const dashboardTestForm = document.getElementById('dashboard-test-form');
     const dashboardTestButton = document.getElementById('dashboard-test-button');
@@ -2188,6 +2192,48 @@ function renderDashboardPage() {
 
     function normalizeTranscriptText(value) {
       return String(value || '').trim();
+    }
+
+    function getRunPhoneNumber(logs) {
+      if (!Array.isArray(logs)) {
+        return '';
+      }
+
+      for (const event of logs) {
+        if (!event || typeof event !== 'object') {
+          continue;
+        }
+
+        if (event.type === 'testing.call.created' && event.to) {
+          return String(event.to).trim();
+        }
+
+        if ((event.type === 'testing.call.created' || event.type === 'voice.start') && event.from) {
+          return String(event.from).trim();
+        }
+      }
+
+      return '';
+    }
+
+    function getSelectedRunLabel(run, logs) {
+      if (!run) {
+        return 'No run selected';
+      }
+
+      const name = String(run.prospectName || '').trim();
+      const phone = getRunPhoneNumber(logs);
+
+      if (name && phone) {
+        return name + ' · ' + phone;
+      }
+      if (name) {
+        return name;
+      }
+      if (phone) {
+        return phone;
+      }
+      return 'Run selected';
     }
 
     function buildTranscriptCopyText(entries) {
@@ -2434,7 +2480,7 @@ function renderDashboardPage() {
       }
 
       const run = state.detail.run;
-      selectedIdEl.textContent = run.callSid;
+      selectedIdEl.textContent = getSelectedRunLabel(run, state.logs);
 
       const summaryCard = document.createElement('div');
       summaryCard.className = 'summary-card';
@@ -2605,8 +2651,6 @@ function renderDashboardPage() {
         renderDetail();
       }
     }
-
-    refreshBtn.addEventListener('click', () => loadRuns().catch(showError));
 
     function showError(error) {
       detailEl.replaceChildren();
@@ -4524,6 +4568,353 @@ streamWss.on("connection", (ws) => {
     }
   });
 });
+
+function readAllRunEvents() {
+  try {
+    const raw = fs.readFileSync(eventLogPath, "utf8");
+    const events = [];
+    for (const line of raw.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        events.push(JSON.parse(trimmed));
+      } catch {
+        // skip malformed line
+      }
+    }
+    return events;
+  } catch {
+    return [];
+  }
+}
+
+function groupRunEventsByCall() {
+  const events = readAllRunEvents();
+  const groups = new Map();
+  for (const ev of events) {
+    if (!ev || !ev.callSid) continue;
+    if (!groups.has(ev.callSid)) groups.set(ev.callSid, []);
+    groups.get(ev.callSid).push(ev);
+  }
+  return groups;
+}
+
+function summarizeCall(events) {
+  const summary = {
+    callSid: null,
+    prospectName: null,
+    propertyName: null,
+    to: null,
+    from: null,
+    status: null,
+    startedAt: null,
+    endedAt: null,
+    completedAt: null,
+    endReason: null,
+    summary: null,
+    lastError: null,
+    messageCount: 0,
+  };
+  for (const ev of events) {
+    if (!summary.callSid && ev.callSid) summary.callSid = ev.callSid;
+    if (ev.prospectName && !summary.prospectName) {
+      summary.prospectName = ev.prospectName;
+    }
+    if (ev.propertyName && !summary.propertyName) {
+      summary.propertyName = ev.propertyName;
+    }
+    if (ev.to && !summary.to) summary.to = ev.to;
+    if (ev.from && !summary.from) summary.from = ev.from;
+    if (!summary.startedAt) summary.startedAt = ev.ts || null;
+    if (ev.ts) summary.endedAt = ev.ts;
+    if (ev.type === "transcript.user" || ev.type === "transcript.agent") {
+      summary.messageCount += 1;
+    }
+    if (ev.type === "state.update") {
+      if (ev.status) summary.status = ev.status;
+      if (ev.summary) summary.summary = ev.summary;
+      if (ev.endReason) summary.endReason = ev.endReason;
+      if (ev.completedAt) summary.completedAt = ev.completedAt;
+      if (ev.lastError) summary.lastError = ev.lastError;
+    }
+  }
+  return summary;
+}
+
+function buildMcpServer() {
+  const mcp = new McpServer({
+    name: "voice-agent-transcripts",
+    version: "0.1.0",
+    instructions:
+      "Tools to explore tenant-screening voice calls: list calls, fetch full transcripts, read raw runtime events, and search across transcripts.",
+  });
+
+  mcp.registerTool(
+    "list_calls",
+    {
+      description:
+        "List recent tenant-screening calls with summary info (prospect, status, start/end, message count). Most recent first.",
+      inputSchema: {
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(500)
+          .optional()
+          .describe("Maximum number of calls to return. Defaults to 20."),
+        status: z
+          .string()
+          .optional()
+          .describe(
+            "Filter by latest status (e.g. 'active', 'completed', 'failed').",
+          ),
+        since: z
+          .string()
+          .optional()
+          .describe(
+            "ISO timestamp; only include calls whose startedAt is on or after this.",
+          ),
+      },
+    },
+    async ({ limit = 20, status, since }) => {
+      const groups = groupRunEventsByCall();
+      const calls = [];
+      for (const [, events] of groups) calls.push(summarizeCall(events));
+      calls.sort((a, b) =>
+        (b.startedAt || "").localeCompare(a.startedAt || ""),
+      );
+      let filtered = calls;
+      if (status) filtered = filtered.filter((c) => c.status === status);
+      if (since) {
+        filtered = filtered.filter(
+          (c) => c.startedAt && c.startedAt >= since,
+        );
+      }
+      const result = filtered.slice(0, limit);
+      const payload = {
+        total: filtered.length,
+        returned: result.length,
+        calls: result,
+      };
+      return {
+        content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+        structuredContent: payload,
+      };
+    },
+  );
+
+  mcp.registerTool(
+    "get_call_transcript",
+    {
+      description:
+        "Return the full turn-by-turn transcript plus the final summary for a specific call.",
+      inputSchema: {
+        callSid: z.string().describe("Twilio Call SID, e.g. CAxxxx..."),
+      },
+    },
+    async ({ callSid }) => {
+      const groups = groupRunEventsByCall();
+      const events = groups.get(callSid);
+      if (!events) {
+        const payload = { callSid, found: false };
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No events found for callSid ${callSid}.`,
+            },
+          ],
+          structuredContent: payload,
+        };
+      }
+      const transcript = [];
+      for (const ev of events) {
+        if (ev.type === "transcript.user" || ev.type === "transcript.agent") {
+          transcript.push({
+            ts: ev.ts,
+            role: ev.type === "transcript.user" ? "caller" : "agent",
+            text: ev.text,
+            goal: ev.currentGoalKey || null,
+          });
+        }
+      }
+      const payload = {
+        callSid,
+        found: true,
+        summary: summarizeCall(events),
+        transcript,
+      };
+      return {
+        content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+        structuredContent: payload,
+      };
+    },
+  );
+
+  mcp.registerTool(
+    "get_call_events",
+    {
+      description:
+        "Return raw runtime events for a call, optionally filtered by event type.",
+      inputSchema: {
+        callSid: z.string().describe("Twilio Call SID."),
+        types: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "If provided, only events whose 'type' matches one of these are returned (e.g. 'state.update', 'transcript.user').",
+          ),
+      },
+    },
+    async ({ callSid, types }) => {
+      const groups = groupRunEventsByCall();
+      const events = groups.get(callSid) || [];
+      const filtered =
+        types && types.length
+          ? events.filter((e) => types.includes(e.type))
+          : events;
+      const payload = {
+        callSid,
+        count: filtered.length,
+        events: filtered,
+      };
+      return {
+        content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+        structuredContent: payload,
+      };
+    },
+  );
+
+  mcp.registerTool(
+    "search_transcripts",
+    {
+      description:
+        "Case-insensitive substring search across every transcript turn. Returns matching turns with callSid, timestamp, role, goal, and surrounding context.",
+      inputSchema: {
+        query: z
+          .string()
+          .min(1)
+          .describe("Text to search for within transcript turns."),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(500)
+          .optional()
+          .describe("Maximum matches to return. Defaults to 50."),
+        role: z
+          .enum(["caller", "agent"])
+          .optional()
+          .describe("Restrict to caller or agent turns."),
+      },
+    },
+    async ({ query, limit = 50, role }) => {
+      const events = readAllRunEvents();
+      const needle = query.toLowerCase();
+      const matches = [];
+      for (const ev of events) {
+        if (
+          ev.type !== "transcript.user" &&
+          ev.type !== "transcript.agent"
+        ) {
+          continue;
+        }
+        const evRole = ev.type === "transcript.user" ? "caller" : "agent";
+        if (role && role !== evRole) continue;
+        if (typeof ev.text !== "string") continue;
+        if (!ev.text.toLowerCase().includes(needle)) continue;
+        matches.push({
+          callSid: ev.callSid,
+          ts: ev.ts,
+          role: evRole,
+          text: ev.text,
+          goal: ev.currentGoalKey || null,
+        });
+        if (matches.length >= limit) break;
+      }
+      const payload = {
+        query,
+        role: role || null,
+        count: matches.length,
+        matches,
+      };
+      return {
+        content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+        structuredContent: payload,
+      };
+    },
+  );
+
+  return mcp;
+}
+
+const mcpOAuthSecret = (process.env.MCP_BEARER_TOKEN || "").trim();
+const mcpIssuerUrl = appBaseUrl;
+const mcpStorePath =
+  process.env.MCP_OAUTH_STORE_PATH ||
+  path.join(path.dirname(statePath), "mcp-oauth-store.json");
+
+if (mcpOAuthSecret && mcpIssuerUrl) {
+  const { requireAuth } = mountMcpOAuth(app, {
+    storePath: mcpStorePath,
+    consentSecret: mcpOAuthSecret,
+    issuerUrl: mcpIssuerUrl,
+  });
+
+  app.post("/mcp", requireAuth, async (req, res) => {
+    let transport;
+    let mcp;
+    try {
+      mcp = buildMcpServer();
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+      });
+      res.on("close", () => {
+        try {
+          transport?.close();
+        } catch {}
+        try {
+          mcp?.close();
+        } catch {}
+      });
+      await mcp.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      console.error("[mcp] handler error:", error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "Internal server error" },
+          id: null,
+        });
+      }
+    }
+  });
+
+  app.get("/mcp", (_req, res) => {
+    res.status(405).json({
+      jsonrpc: "2.0",
+      error: { code: -32000, message: "Method not allowed." },
+      id: null,
+    });
+  });
+
+  app.delete("/mcp", (_req, res) => {
+    res.status(405).json({
+      jsonrpc: "2.0",
+      error: { code: -32000, message: "Method not allowed." },
+      id: null,
+    });
+  });
+
+  console.log(
+    `[mcp] OAuth-protected endpoint mounted at ${mcpIssuerUrl}/mcp (issuer ${mcpIssuerUrl})`,
+  );
+} else {
+  console.warn(
+    "[mcp] /mcp endpoint NOT mounted: requires both MCP_BEARER_TOKEN and APP_BASE_URL.",
+  );
+}
 
 const port = Number(process.env.VOICE_PORT || 8002);
 server.listen(port, () => {

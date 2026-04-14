@@ -8,6 +8,55 @@ const proxy = httpProxy.createProxyServer({
   changeOrigin: true,
 });
 
+proxy.on('error', (err, req, res) => {
+  console.error(`[proxy] upstream error for ${req?.method} ${req?.url}: ${err.code || err.message}`);
+  if (res && !res.headersSent) {
+    try {
+      res.writeHead(502, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          error: 'Bad gateway',
+          detail: err.code || err.message,
+        }),
+      );
+    } catch {}
+  } else if (res && typeof res.destroy === 'function') {
+    try { res.destroy(); } catch {}
+  }
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[proxy] uncaughtException:', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[proxy] unhandledRejection:', reason);
+});
+
+const FORWARD_PREFIXES = [
+  '/voice',
+  '/testing',
+  '/dashboard',
+  '/formspree',
+  '/mcp',
+  '/.well-known/oauth-',
+  '/authorize',
+  '/token',
+  '/register',
+  '/revoke',
+  '/oauth/',
+];
+
+function shouldForward(url) {
+  return FORWARD_PREFIXES.some(
+    (prefix) =>
+      url === prefix ||
+      url.startsWith(`${prefix}/`) ||
+      url.startsWith(`${prefix}?`) ||
+      url.startsWith(prefix),
+  );
+}
+
 function route(req, res) {
   const url = req.url || '/';
 
@@ -17,26 +66,8 @@ function route(req, res) {
     return;
   }
 
-  if (url.startsWith('/voice')) {
-    console.log(`[voice] ${req.method} ${req.url}`);
-    proxy.web(req, res, { target: `http://localhost:${VOICE_PORT}` });
-    return;
-  }
-
-  if (url.startsWith('/testing')) {
-    console.log(`[testing] ${req.method} ${req.url}`);
-    proxy.web(req, res, { target: `http://localhost:${VOICE_PORT}` });
-    return;
-  }
-
-  if (url.startsWith('/dashboard')) {
-    console.log(`[dashboard] ${req.method} ${req.url}`);
-    proxy.web(req, res, { target: `http://localhost:${VOICE_PORT}` });
-    return;
-  }
-
-  if (url.startsWith('/formspree')) {
-    console.log(`[formspree] ${req.method} ${req.url}`);
+  if (shouldForward(url)) {
+    console.log(`[proxy] ${req.method} ${req.url}`);
     proxy.web(req, res, { target: `http://localhost:${VOICE_PORT}` });
     return;
   }

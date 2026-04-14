@@ -236,13 +236,26 @@ else
   export VOICE_PUBLIC_BASE_URL="$APP_BASE_URL"
   write_runtime_config
 
-  echo "Starting proxy on port ${PROXY_PORT}..."
-  node "$ROOT_DIR/mcp-auth-proxy.js" &
-  PROXY_PID=$!
-
   echo "Starting voice bridge on port ${VOICE_PORT}..."
   node "$ROOT_DIR/voice-bridge.js" &
   VOICE_PID=$!
+
+  echo "Waiting for voice bridge to listen on port ${VOICE_PORT}..."
+  for i in $(seq 1 60); do
+    if (echo > "/dev/tcp/127.0.0.1/${VOICE_PORT}") >/dev/null 2>&1; then
+      echo "Voice bridge ready after ${i}s."
+      break
+    fi
+    if ! kill -0 "$VOICE_PID" 2>/dev/null; then
+      echo "Voice bridge exited before listening; aborting startup."
+      exit 1
+    fi
+    sleep 1
+  done
+
+  echo "Starting proxy on port ${PROXY_PORT}..."
+  node "$ROOT_DIR/mcp-auth-proxy.js" &
+  PROXY_PID=$!
 fi
 
 while true; do
